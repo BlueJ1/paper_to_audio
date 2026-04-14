@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Paper to Audio</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #f0f2f5;
+      --card: #ffffff;
+      --border: #e2e8f0;
+      --primary: #4f46e5;
+      --primary-hover: #4338ca;
+      --success: #059669;
+      --error: #dc2626;
+      --muted: #6b7280;
+      --text: #111827;
+      --radius: 12px;
+      --shadow: 0 1px 3px rgba(0,0,0,.08), 0 4px 16px rgba(0,0,0,.06);
+    }
+
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 32px 16px 64px;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 36px;
+    }
+    header h1 { font-size: 1.9rem; font-weight: 700; letter-spacing: -.5px; }
+    header p  { color: var(--muted); margin-top: 6px; font-size: .95rem; }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 28px 32px;
+      max-width: 780px;
+      margin: 0 auto 24px;
+    }
+
+    .card-title {
+      font-size: .75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: var(--muted);
+      margin-bottom: 18px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .step-badge {
+      background: var(--primary);
+      color: #fff;
+      border-radius: 50%;
+      width: 20px; height: 20px;
+      font-size: .7rem;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    /* Drop zone */
+    #drop-zone {
+      border: 2px dashed var(--border);
+      border-radius: 10px;
+      padding: 40px 24px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color .2s, background .2s;
+      position: relative;
+    }
+    #drop-zone:hover, #drop-zone.over {
+      border-color: var(--primary);
+      background: #eef2ff;
+    }
+    #drop-zone input[type=file] {
+      position: absolute;
+      inset: 0;
+      opacity: 0;
+      cursor: pointer;
+      width: 100%;
+      height: 100%;
+    }
+    #drop-zone .icon { font-size: 2.4rem; margin-bottom: 10px; }
+    #drop-zone .label { font-size: 1rem; font-weight: 500; }
+    #drop-zone .sub   { font-size: .83rem; color: var(--muted); margin-top: 4px; }
+
+    #file-chosen {
+      margin-top: 14px;
+      display: none;
+      align-items: center;
+      gap: 10px;
+      background: #f0fdf4;
+      border: 1px solid #bbf7d0;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: .9rem;
+    }
+    #file-chosen .file-icon { font-size: 1.3rem; }
+    #file-chosen .file-name { font-weight: 500; color: var(--success); }
+    #file-chosen .change-btn {
+      margin-left: auto;
+      font-size: .8rem;
+      color: var(--muted);
+      cursor: pointer;
+      text-decoration: underline;
+      background: none;
+      border: none;
+      padding: 0;
+    }
+
+    /* Options row */
+    .options-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 20px;
+      margin-top: 22px;
+      align-items: center;
+    }
+    .option-group label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: .92rem;
+      cursor: pointer;
+      font-weight: 500;
+    }
+    .option-group select {
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 6px 10px;
+      font-size: .9rem;
+      background: #fff;
+      cursor: pointer;
+    }
+    .toggle {
+      appearance: none;
+      width: 38px; height: 22px;
+      background: #cbd5e1;
+      border-radius: 11px;
+      position: relative;
+      cursor: pointer;
+      transition: background .2s;
+      flex-shrink: 0;
+    }
+    .toggle::after {
+      content: '';
+      position: absolute;
+      width: 16px; height: 16px;
+      background: #fff;
+      border-radius: 50%;
+      top: 3px; left: 3px;
+      transition: left .2s;
+      box-shadow: 0 1px 3px rgba(0,0,0,.2);
+    }
+    .toggle:checked { background: var(--primary); }
+    .toggle:checked::after { left: 19px; }
+
+    /* Buttons */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 22px;
+      border-radius: 8px;
+      font-size: .93rem;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+      transition: background .15s, opacity .15s, transform .1s;
+    }
+    .btn:active { transform: scale(.98); }
+    .btn:disabled { opacity: .5; cursor: not-allowed; transform: none; }
+    .btn-primary { background: var(--primary); color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
+    .btn-secondary {
+      background: #fff;
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .btn-secondary:hover:not(:disabled) { background: var(--bg); }
+    .btn-success { background: var(--success); color: #fff; }
+    .btn-success:hover:not(:disabled) { background: #047857; }
+
+    .btn-row {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-top: 20px;
+    }
+
+    /* Log */
+    .log-box {
+      background: #0f172a;
+      color: #94a3b8;
+      font-family: 'SF Mono', 'Fira Mono', monospace;
+      font-size: .78rem;
+      border-radius: 8px;
+      padding: 16px;
+      min-height: 120px;
+      max-height: 300px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      line-height: 1.6;
+    }
+    .log-line-done  { color: #4ade80; }
+    .log-line-error { color: #f87171; }
+    .log-line-log   { color: #94a3b8; }
+
+    /* Spinner */
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner {
+      width: 16px; height: 16px;
+      border: 2px solid rgba(255,255,255,.35);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin .6s linear infinite;
+      flex-shrink: 0;
+    }
+    .spinner-dark {
+      border-color: rgba(79,70,229,.25);
+      border-top-color: var(--primary);
+    }
+
+    /* Text area */
+    #text-area {
+      width: 100%;
+      min-height: 320px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px;
+      font-size: .88rem;
+      line-height: 1.7;
+      resize: vertical;
+      font-family: inherit;
+      color: var(--text);
+    }
+    #text-area:focus { outline: 2px solid var(--primary); border-color: transparent; }
+
+    .char-count {
+      font-size: .78rem;
+      color: var(--muted);
+      text-align: right;
+      margin-top: 6px;
+    }
+
+    /* Audio player */
+    audio {
+      width: 100%;
+      margin-top: 4px;
+      border-radius: 8px;
+    }
+
+    /* Hidden */
+    .hidden { display: none !important; }
+
+    /* Status badge */
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: .8rem;
+      font-weight: 500;
+      padding: 4px 10px;
+      border-radius: 999px;
+    }
+    .status-running { background: #eff6ff; color: #2563eb; }
+    .status-done    { background: #f0fdf4; color: var(--success); }
+    .status-error   { background: #fef2f2; color: var(--error); }
+
+    .dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>📄 Paper to Audio</h1>
+  <p>Convert academic PDFs into listenable audio.</p>
+</header>
+
+<!-- Step 1: Upload -->
+<div class="card" id="card-upload">
+  <div class="card-title"><span class="step-badge">1</span> Upload PDF</div>
+
+  <div id="drop-zone">
+    <input type="file" id="file-input" accept=".pdf" />
+    <div class="icon">📂</div>
+    <div class="label">Drop your PDF here</div>
+    <div class="sub">or click to browse</div>
+  </div>
+
+  <div id="file-chosen">
+    <span class="file-icon">📄</span>
+    <span class="file-name" id="file-name-label"></span>
+    <button class="change-btn" id="change-file-btn">change</button>
+  </div>
+
+  <div class="options-row">
+    <div class="option-group">
+      <label>
+        <input type="checkbox" class="toggle" id="use-llm-toggle" />
+        Use LLM cleanup
+        <span style="font-size:.8rem;color:var(--muted);font-weight:400">(needs API key)</span>
+      </label>
+    </div>
+    <div class="option-group">
+      <label>
+        LLM Model
+        <select id="llm-model-select">
+          <option value="google:gemma-3-27b-it">gemma-3-27b-it (Google, fast)</option>
+          <option value="google:gemma-3-12b-it">gemma-3-12b-it (Google, faster)</option>
+          <option value="google:gemma-4-31b-it">gemma-4-31b-it (Google, slow, thinking)</option>
+          <option value="google:gemma-4-26b-a4b-it">gemma-4-26b-a4b-it (Google, slow, thinking)</option>
+          <option value="google:gemini-3.1-flash-lite-preview">gemini-3.1-flash-lite-preview (Google, fast)</option>
+          <option value="cerebras:qwen-3-235b-a22b-instruct-2507">qwen-3-235b-a22b-instruct-2507 (Cerebras, fast)</option>
+        </select>
+      </label>
+    </div>
+    <div class="option-group">
+      <label>
+        TTS Engine
+        <select id="tts-engine-select">
+          <option value="kokoro">Kokoro (local, free)</option>
+          <option value="murf">Murf.ai (cloud, paid)</option>
+        </select>
+      </label>
+    </div>
+  </div>
+
+  <div class="btn-row">
+    <button class="btn btn-primary" id="process-btn" disabled>
+      Process PDF
+    </button>
+  </div>
+</div>
+
+<!-- Step 2: Text processing log -->
+<div class="card hidden" id="card-text-log">
+  <div class="card-title" style="justify-content:space-between">
+    <span><span class="step-badge">2</span> Processing</span>
+    <span class="status-badge status-running" id="text-status-badge">
+      <span class="dot"></span> Running
+    </span>
+  </div>
+  <div class="log-box" id="text-log"></div>
+</div>
+
+<!-- Step 3: Edit text -->
+<div class="card hidden" id="card-text">
+  <div class="card-title"><span class="step-badge">3</span> Review &amp; Edit Text</div>
+  <textarea id="text-area" spellcheck="false" placeholder="Processed text will appear here…"></textarea>
+  <div class="char-count" id="char-count">0 characters</div>
+  <div class="btn-row">
+    <button class="btn btn-primary" id="generate-btn">
+      Generate Audio
+    </button>
+  </div>
+</div>
+
+<!-- Step 4: Audio generation log -->
+<div class="card hidden" id="card-audio-log">
+  <div class="card-title" style="justify-content:space-between">
+    <span><span class="step-badge">4</span> Generating Audio</span>
+    <span class="status-badge status-running" id="audio-status-badge">
+      <span class="dot"></span> Running
+    </span>
+  </div>
+  <div class="log-box" id="audio-log"></div>
+</div>
+
+<!-- Step 5: Audio player -->
+<div class="card hidden" id="card-audio">
+  <div class="card-title"><span class="step-badge">5</span> Audio Ready</div>
+  <audio id="audio-player" controls></audio>
+  <div class="btn-row">
+    <a class="btn btn-success" id="download-btn" href="#" download="paper_audio.mp3">
+      ⬇ Download MP3
+    </a>
+    <button class="btn btn-secondary" id="regenerate-btn">
+      Regenerate
+    </button>
+  </div>
+</div>
+
+<script>
+  const $ = id => document.getElementById(id);
+
+  // --- State ---
+  let jobId = null;
+  let selectedFile = null;
+
+  // --- LLM toggle gates model selector ---
+  $('use-llm-toggle').addEventListener('change', () => {
+    $('llm-model-select').disabled = !$('use-llm-toggle').checked;
+  });
+  $('llm-model-select').disabled = true; // off by default
+
+  // --- Drop zone ---
+  const dropZone  = $('drop-zone');
+  const fileInput = $('file-input');
+
+  dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('over'); });
+  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('over'));
+  dropZone.addEventListener('drop', e => {
+    e.preventDefault();
+    dropZone.classList.remove('over');
+    const file = e.dataTransfer.files[0];
+    if (file) handleFile(file);
+  });
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files[0]) handleFile(fileInput.files[0]);
+  });
+  $('change-file-btn').addEventListener('click', () => {
+    fileInput.value = '';
+    selectedFile = null;
+    $('file-chosen').style.display = 'none';
+    dropZone.style.display = '';
+    $('process-btn').disabled = true;
+  });
+
+  function handleFile(file) {
+    if (!file.name.toLowerCase().endsWith('.pdf')) {
+      alert('Please select a PDF file.');
+      return;
+    }
+    selectedFile = file;
+    $('file-name-label').textContent = file.name;
+    $('file-chosen').style.display = 'flex';
+    dropZone.style.display = 'none';
+    $('process-btn').disabled = false;
+  }
+
+  // --- Char count ---
+  $('text-area').addEventListener('input', updateCharCount);
+  function updateCharCount() {
+    $('char-count').textContent = $('text-area').value.length.toLocaleString() + ' characters';
+  }
+
+  // --- Process PDF ---
+  $('process-btn').addEventListener('click', async () => {
+    if (!selectedFile) return;
+
+    $('process-btn').disabled = true;
+    $('card-text-log').classList.remove('hidden');
+    $('card-text').classList.add('hidden');
+    $('card-audio-log').classList.add('hidden');
+    $('card-audio').classList.add('hidden');
+    $('text-log').textContent = '';
+    setStatus('text', 'running');
+
+    // Upload PDF
+    const form = new FormData();
+    form.append('pdf', selectedFile);
+    let res;
+    try {
+      res = await fetch('/upload', { method: 'POST', body: form });
+    } catch (e) {
+      appendLog('text', `Upload error: ${e}`, 'error');
+      return;
+    }
+    if (!res.ok) {
+      const err = await res.json();
+      appendLog('text', `Upload error: ${err.error}`, 'error');
+      setStatus('text', 'error');
+      return;
+    }
+    const { job_id } = await res.json();
+    jobId = job_id;
+
+    // Start processing
+    const useLlm = $('use-llm-toggle').checked;
+    const llmModel = $('llm-model-select').value;
+    await fetch(`/process-text/${jobId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ use_llm: useLlm, llm_model: llmModel }),
+    });
+
+    // Stream progress
+    streamJob(`/stream/${jobId}`, 'text', msg => {
+      if (msg.type === 'done') {
+        $('text-area').value = msg.text;
+        updateCharCount();
+        $('card-text').classList.remove('hidden');
+        $('card-text').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    });
+  });
+
+  // --- Generate Audio ---
+  $('generate-btn').addEventListener('click', startAudioGeneration);
+  $('regenerate-btn').addEventListener('click', startAudioGeneration);
+
+  async function startAudioGeneration() {
+    if (!jobId) return;
+    const text = $('text-area').value.trim();
+    if (!text) { alert('Text area is empty.'); return; }
+
+    $('generate-btn').disabled = true;
+    $('card-audio-log').classList.remove('hidden');
+    $('card-audio').classList.add('hidden');
+    $('audio-log').textContent = '';
+    setStatus('audio', 'running');
+
+    const ttsEngine = $('tts-engine-select').value;
+    await fetch(`/generate-audio/${jobId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, tts_engine: ttsEngine }),
+    });
+
+    streamJob(`/stream/${jobId}`, 'audio', msg => {
+      if (msg.type === 'done') {
+        const url = msg.audio_url;
+        $('audio-player').src = url;
+        $('download-btn').href = url + '?download=1';
+        $('card-audio').classList.remove('hidden');
+        $('card-audio').scrollIntoView({ behavior: 'smooth', block: 'start' });
+        $('generate-btn').disabled = false;
+      }
+    });
+  }
+
+  // --- SSE helper ---
+  function streamJob(url, logTarget, onDone) {
+    const es = new EventSource(url);
+    es.onmessage = e => {
+      let msg;
+      try { msg = JSON.parse(e.data); } catch { return; }
+
+      if (msg.type === 'ping') return;
+
+      if (msg.type === 'log') {
+        appendLog(logTarget, msg.message, 'log');
+      } else if (msg.type === 'done') {
+        appendLog(logTarget, '✓ Done!', 'done');
+        setStatus(logTarget, 'done');
+        es.close();
+        onDone(msg);
+      } else if (msg.type === 'error') {
+        appendLog(logTarget, `✗ Error: ${msg.message}`, 'error');
+        setStatus(logTarget, 'error');
+        $('generate-btn').disabled = false;
+        $('process-btn').disabled = false;
+        es.close();
+      }
+    };
+    es.onerror = () => {
+      appendLog(logTarget, 'Connection lost.', 'error');
+      setStatus(logTarget, 'error');
+      es.close();
+    };
+  }
+
+  function appendLog(target, text, cls) {
+    const box = target === 'text' ? $('text-log') : $('audio-log');
+    const line = document.createElement('span');
+    line.className = `log-line-${cls}`;
+    line.textContent = text + '\n';
+    box.appendChild(line);
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function setStatus(target, state) {
+    const badge = target === 'text' ? $('text-status-badge') : $('audio-status-badge');
+    badge.className = 'status-badge';
+    if (state === 'running') {
+      badge.classList.add('status-running');
+      badge.innerHTML = '<span class="dot"></span> Running';
+    } else if (state === 'done') {
+      badge.classList.add('status-done');
+      badge.innerHTML = '<span class="dot"></span> Done';
+    } else {
+      badge.classList.add('status-error');
+      badge.innerHTML = '<span class="dot"></span> Error';
+    }
+  }
+</script>
+</body>
+</html>

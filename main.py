@@ -7,8 +7,8 @@ import argparse
 import os
 import tempfile
 
-from pdf_to_text import load_pdf_text, build_llm, rewrite_for_audio
-from text_to_speech import load_settings, split_text, MurfTTSEngine, KokoroTTSEngine, concatenate_audio, Settings
+from pdf_to_text import load_pdf_text, build_llm, clean_for_tts, DEFAULT_LLM_MODEL, DEFAULT_CEREBRAS_MODEL
+from text_to_speech import load_settings, split_text, MurfTTSEngine, KokoroTTSEngine, concatenate_audio, Settings, generate_audio_chunks
 from dotenv import load_dotenv
 
 
@@ -31,6 +31,32 @@ def main() -> None:
         help="Maximum characters per TTS request (defaults to env MURF_CHUNK_CHARS)",
     )
     parser.add_argument(
+        "--kokoro-workers",
+        type=int,
+        default=None,
+        help="Parallel workers for Kokoro (defaults to env KOKORO_WORKERS or 1)",
+    )
+    parser.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="Skip LLM processing, use regex-only cleanup (faster, no API cost)",
+    )
+    parser.add_argument(
+        "--llm-provider",
+        choices=["google", "cerebras"],
+        default="google",
+        help="LLM provider for math rewriting: 'google' (Gemma/Gemini) or 'cerebras' (default: google)",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default=None,
+        help=(
+            f"Model for math rewriting. "
+            f"Google default: {DEFAULT_LLM_MODEL}. "
+            f"Cerebras default: {DEFAULT_CEREBRAS_MODEL}."
+        ),
+    )
+    parser.add_argument(
         "--keep-text",
         action="store_true",
         help="Keep the intermediate text file instead of deleting it",
@@ -42,11 +68,21 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Resolve model default based on provider
+    if args.llm_model is None:
+        args.llm_model = (
+            DEFAULT_CEREBRAS_MODEL if args.llm_provider == "cerebras" else DEFAULT_LLM_MODEL
+        )
+
     # Load environment variables
     load_dotenv()
-    google_api_key = os.getenv("GOOGLE_API_KEY", "").strip()
-    if not google_api_key and not args.text_file:
-        raise RuntimeError("Missing GOOGLE_API_KEY in environment.")
+    if not args.no_llm and not args.text_file:
+        if args.llm_provider == "cerebras":
+            if not os.getenv("CEREBRAS_API_KEY", "").strip():
+                raise RuntimeError("Missing CEREBRAS_API_KEY in environment.")
+        else:
+            if not os.getenv("GOOGLE_API_KEY", "").strip():
+                raise RuntimeError("Missing GOOGLE_API_KEY in environment.")
 
     # Determine intermediate text file path
     if args.text_file:
@@ -70,11 +106,11 @@ def main() -> None:
         paper_text = load_pdf_text(args.pdf)
         print(f"      Loaded {len(paper_text)} characters")
 
-        # Step 2: Process with LLM
-        print("[2/5] Processing with Gemini (this may take a while)...")
-        llm = build_llm()
-        rewritten = rewrite_for_audio(llm, paper_text)
-        print(f"      Generated {len(rewritten)} characters of audio-friendly text")
+        # Step 2: Clean text for TTS (targeted replacements)
+        print("[2/5] Cleaning text for TTS...")
+        llm = None if args.no_llm else build_llm(model=args.llm_model, provider=args.llm_provider)
+        rewritten = clean_for_tts(paper_text, llm=llm)
+        print(f"      Output: {len(rewritten)} characters of audio-friendly text")
 
         # Save intermediate text file
         with open(text_file, "w", encoding="utf-8") as f:
@@ -92,7 +128,12 @@ def main() -> None:
             murf_format=settings.murf_format,
             murf_chunk_chars=args.max_chars,
             kokoro_voice=settings.kokoro_voice,
+            kokoro_workers=settings.kokoro_workers,
         )
+
+    kokoro_workers = (
+        args.kokoro_workers if args.kokoro_workers is not None else settings.kokoro_workers
+    )
 
     # Step 3: Split text into chunks
     print(f"[3/5] Splitting into chunks (max {settings.murf_chunk_chars} chars each)...")
@@ -102,15 +143,12 @@ def main() -> None:
     # Step 4: Generate audio
     if args.tts_engine == "kokoro":
         print(f"[4/5] Generating audio with Kokoro (voice: {settings.kokoro_voice}, local)...")
-        tts_engine = KokoroTTSEngine(settings)
+        tts_engine = None if kokoro_workers > 1 else KokoroTTSEngine(settings)
     else:
         print(f"[4/5] Generating audio with Murf.ai (voice: {settings.murf_voice_id})...")
         tts_engine = MurfTTSEngine(settings)
 
-    audio_chunks = []
-    for i, chunk in enumerate(chunks, 1):
-        print(f"      Processing chunk {i}/{len(chunks)}...")
-        audio_chunks.append(tts_engine.generate_speech(chunk))
+    audio_chunks = generate_audio_chunks(chunks, settings, tts_engine, kokoro_workers)
 
     # Step 5: Save audio
     print(f"[5/5] Saving audio to {args.out}...")

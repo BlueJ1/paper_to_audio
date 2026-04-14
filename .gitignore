@@ -1,8 +1,25 @@
-/.env
+# Environment and secrets
+.env
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
+
+# Virtualenvs
 .venv/
 venv/
+
+# OS / editor metadata
+.DS_Store
+.idea/
+.vscode/
+
+# Test caches
+.pytest_cache/
+
+# Generated pipeline artifacts
 *.mp3
 *.wav
+*_audio_text.txt
+*_output.txt

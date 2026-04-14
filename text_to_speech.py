@@ -7,7 +7,9 @@ import io
 import os
 import re
 from dataclasses import dataclass
-from typing import Iterable, List, Protocol
+from typing import Iterable, List, Protocol, Dict, Optional
+import concurrent.futures
+import multiprocessing
 
 import requests
 from dotenv import load_dotenv
@@ -33,6 +35,7 @@ class Settings:
     murf_format: str
     murf_chunk_chars: int
     kokoro_voice: str
+    kokoro_workers: int
 
 
 def load_settings(tts_engine: str = "murf") -> Settings:
@@ -47,6 +50,7 @@ def load_settings(tts_engine: str = "murf") -> Settings:
     murf_format = os.getenv("MURF_FORMAT", "mp3").strip() or "mp3"
     murf_chunk_chars = int(os.getenv("MURF_CHUNK_CHARS", "2800").strip())
     kokoro_voice = os.getenv("KOKORO_VOICE", "af_bella").strip() or "af_bella"
+    kokoro_workers = int(os.getenv("KOKORO_WORKERS", "1").strip() or "1")
 
     return Settings(
         tts_engine=tts_engine,
@@ -55,6 +59,7 @@ def load_settings(tts_engine: str = "murf") -> Settings:
         murf_format=murf_format,
         murf_chunk_chars=murf_chunk_chars,
         kokoro_voice=kokoro_voice,
+        kokoro_workers=kokoro_workers,
     )
 
 
@@ -148,33 +153,101 @@ class KokoroTTSEngine:
 
     def generate_speech(self, text: str) -> bytes:
         """Generate speech using Kokoro model."""
-        # Generate audio samples - pipeline returns a generator
-        # Each iteration yields (graphemes, phonemes, audio)
-        generator = self.pipeline(text, voice=self.settings.kokoro_voice)
+        return _kokoro_generate_bytes(self.pipeline, self.settings.kokoro_voice, text)
 
-        # Collect all audio chunks
-        audio_chunks = []
-        for _, _, audio in generator:
-            audio_chunks.append(audio)
 
-        # Concatenate all audio chunks
-        if not audio_chunks:
-            raise RuntimeError("No audio generated from Kokoro pipeline")
+_KOKORO_PIPELINE: Optional[KPipeline] = None
+_KOKORO_VOICE: Optional[str] = None
 
-        samples = np.concatenate(audio_chunks)
-        sample_rate = 24000  # Kokoro uses 24kHz sample rate
 
-        # Write to temporary WAV buffer using soundfile
-        wav_buffer = io.BytesIO()
-        sf.write(wav_buffer, samples, sample_rate, format="WAV")
-        wav_buffer.seek(0)
+def _kokoro_generate_bytes(pipeline: KPipeline, voice: str, text: str) -> bytes:
+    """Generate speech using Kokoro pipeline and return MP3 bytes."""
+    generator = pipeline(text, voice=voice)
 
-        # Convert WAV to MP3 using pydub
-        audio_segment = AudioSegment.from_wav(wav_buffer)
-        mp3_buffer = io.BytesIO()
-        audio_segment.export(mp3_buffer, format="mp3", bitrate="128k")
+    audio_chunks = []
+    for _, _, audio in generator:
+        audio_chunks.append(audio)
 
-        return mp3_buffer.getvalue()
+    if not audio_chunks:
+        raise RuntimeError("No audio generated from Kokoro pipeline")
+
+    samples = np.concatenate(audio_chunks)
+    sample_rate = 24000
+
+    wav_buffer = io.BytesIO()
+    sf.write(wav_buffer, samples, sample_rate, format="WAV")
+    wav_buffer.seek(0)
+
+    audio_segment = AudioSegment.from_wav(wav_buffer)
+    mp3_buffer = io.BytesIO()
+    audio_segment.export(mp3_buffer, format="mp3", bitrate="128k")
+
+    return mp3_buffer.getvalue()
+
+
+def _kokoro_worker_init(voice: str) -> None:
+    global _KOKORO_PIPELINE, _KOKORO_VOICE
+    _KOKORO_PIPELINE = KPipeline(lang_code="a")
+    _KOKORO_VOICE = voice
+
+
+def _kokoro_generate_chunk(text: str) -> bytes:
+    if _KOKORO_PIPELINE is None or _KOKORO_VOICE is None:
+        raise RuntimeError("Kokoro worker not initialized")
+    return _kokoro_generate_bytes(_KOKORO_PIPELINE, _KOKORO_VOICE, text)
+
+
+def _collect_ordered(
+    futures: Dict[concurrent.futures.Future, int],
+    total: int,
+    progress_label: Optional[str] = None,
+) -> List[bytes]:
+    results: List[bytes] = [b""] * total
+    for future in concurrent.futures.as_completed(futures):
+        idx = futures[future]
+        results[idx] = future.result()
+        if progress_label:
+            print(f"      Completed {progress_label} {idx + 1}/{total}...")
+    return results
+
+
+def _generate_kokoro_parallel(chunks: List[str], voice: str, workers: int) -> List[bytes]:
+    if not chunks:
+        return []
+    worker_count = min(workers, len(chunks))
+    mp_context = multiprocessing.get_context("spawn")
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=worker_count,
+        mp_context=mp_context,
+        initializer=_kokoro_worker_init,
+        initargs=(voice,),
+    ) as executor:
+        futures = {
+            executor.submit(_kokoro_generate_chunk, chunk): i
+            for i, chunk in enumerate(chunks)
+        }
+        return _collect_ordered(futures, len(chunks), progress_label="chunk")
+
+
+def generate_audio_chunks(
+    chunks: List[str],
+    settings: Settings,
+    tts_engine: Optional[TTSEngine],
+    kokoro_workers: int,
+) -> List[bytes]:
+    """Generate audio for all chunks, optionally in parallel for Kokoro."""
+    if settings.tts_engine == "kokoro" and kokoro_workers > 1:
+        print(f"      Using {kokoro_workers} parallel workers for Kokoro...")
+        return _generate_kokoro_parallel(chunks, settings.kokoro_voice, kokoro_workers)
+
+    if tts_engine is None:
+        raise RuntimeError("TTS engine is not initialized")
+
+    audio_chunks: List[bytes] = []
+    for i, chunk in enumerate(chunks, 1):
+        print(f"      Processing chunk {i}/{len(chunks)}...")
+        audio_chunks.append(tts_engine.generate_speech(chunk))
+    return audio_chunks
 
 
 def concatenate_audio(chunks: Iterable[bytes], output_path: str) -> None:
@@ -212,6 +285,12 @@ def main() -> None:
         default=None,
         help="Maximum characters per TTS request (defaults to env MURF_CHUNK_CHARS)",
     )
+    parser.add_argument(
+        "--kokoro-workers",
+        type=int,
+        default=None,
+        help="Parallel workers for Kokoro (defaults to env KOKORO_WORKERS or 1)",
+    )
     args = parser.parse_args()
 
     # Determine output filename
@@ -231,7 +310,12 @@ def main() -> None:
             murf_format=settings.murf_format,
             murf_chunk_chars=args.max_chars,
             kokoro_voice=settings.kokoro_voice,
+            kokoro_workers=settings.kokoro_workers,
         )
+
+    kokoro_workers = (
+        args.kokoro_workers if args.kokoro_workers is not None else settings.kokoro_workers
+    )
 
     print(f"[1/4] Loading text from: {args.text_file}")
     with open(args.text_file, "r", encoding="utf-8") as f:
@@ -245,15 +329,12 @@ def main() -> None:
     # Initialize the appropriate TTS engine
     if args.tts_engine == "kokoro":
         print(f"[3/4] Generating audio with Kokoro (voice: {settings.kokoro_voice}, local)...")
-        tts_engine = KokoroTTSEngine(settings)
+        tts_engine = None if kokoro_workers > 1 else KokoroTTSEngine(settings)
     else:
         print(f"[3/4] Generating audio with Murf.ai (voice: {settings.murf_voice_id})...")
         tts_engine = MurfTTSEngine(settings)
 
-    audio_chunks = []
-    for i, chunk in enumerate(chunks, 1):
-        print(f"      Processing chunk {i}/{len(chunks)}...")
-        audio_chunks.append(tts_engine.generate_speech(chunk))
+    audio_chunks = generate_audio_chunks(chunks, settings, tts_engine, kokoro_workers)
 
     print(f"[4/4] Saving audio to {args.out}...")
     concatenate_audio(audio_chunks, args.out)
