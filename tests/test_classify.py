@@ -86,6 +86,25 @@ class TestIsHeading:
         b = _block(long, size=13.0)
         assert _is_heading(b, body_size=10.0) is False
 
+    def test_all_caps_at_body_size_is_heading(self):
+        # ICLR/NeurIPS style: "ABSTRACT" / "1 INTRODUCTION" at body size,
+        # not bold. Path A (size bump) and Path B (bold) both fail — Path C
+        # catches these by all-caps short-line structural signal alone.
+        assert _is_heading(_block("ABSTRACT", size=9.9), body_size=10.0) is True
+        assert _is_heading(_block("1 INTRODUCTION", size=9.9), body_size=10.0) is True
+        assert _is_heading(_block("2 RELATED WORK", size=10.3), body_size=10.0) is True
+        assert _is_heading(_block("3 METHOD", size=9.9), body_size=10.0) is True
+
+    def test_all_caps_at_small_size_is_not_heading(self):
+        # Reject all-caps fragments appearing at figure / caption font sizes:
+        # they're legends or diagram labels, not section headings.
+        assert _is_heading(_block("CLASS", size=6.0), body_size=10.0) is False
+
+    def test_short_all_caps_acronym_is_not_heading(self):
+        # A single-word 2-letter acronym like "AI" on its own line shouldn't
+        # be a heading — too few letters to carry structural meaning.
+        assert _is_heading(_block("AI", size=10.0), body_size=10.0) is False
+
 
 class TestIsCode:
     def test_monospace_flag_marks_code(self):
@@ -147,6 +166,33 @@ class TestIsNoise:
 
     def test_sentence_is_not_noise(self):
         assert _is_noise("This is a plain sentence with several words.") is False
+
+
+class TestArXivHeader:
+    """arXiv margin stamp → classified as noise, never narrated."""
+
+    def test_arxiv_header_becomes_noise(self):
+        # The stamp arrives as a standalone block at whatever font size
+        # pymupdf decoded — classify must drop it before polish sees it
+        # (otherwise the token `arXiv` becomes `archive` and `cs.LG` becomes
+        # `cs.L G` from the acronym rule).
+        b = _block("arXiv:2501.00663v1 [cs.LG] 31 Dec 2024")
+        d = _doc([b])
+        classify_blocks(d)
+        assert d.blocks[0].kind == "noise"
+
+    def test_arxiv_header_with_two_column_paper(self):
+        b = _block("arXiv:1803.02155v2  [cs.CL]  12 Apr 2018")
+        d = _doc([b])
+        classify_blocks(d)
+        assert d.blocks[0].kind == "noise"
+
+    def test_not_arxiv_but_mentions_arxiv_stays_body(self):
+        # Body prose that happens to contain "arXiv" should not be noised.
+        b = _block("We uploaded a pre-print to the arXiv repository last year.")
+        d = _doc([b])
+        classify_blocks(d)
+        assert d.blocks[0].kind == "body"
 
 
 class TestNormalizeRepeating:

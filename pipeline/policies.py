@@ -34,6 +34,14 @@ _DEFAULT_SUPPLEMENTARY = r"^\s*supplement(?:ary|al)(?:\s+material)?.*$"
 # "Appendix", "Appendix A", "Appendix A: Proofs", "Appendices", or bare
 # letter-numbered "A Proofs" when the heading starts with a single capital.
 _DEFAULT_APPENDIX = r"^\s*(?:appendix(?:\s+[A-Z0-9]\S*)?(?:[:\s].*)?|appendices)\s*$"
+# ICLR/NeurIPS style: appendix sections lettered rather than named. Two
+# typographic conventions seen in practice:
+#   "A MULTIHEAD SELF-ATTENTION"                 (ViT — all caps)
+#   "C Long-term Memory Module (LMM) as a …"    (Titans — title case)
+# Main body sections in the same papers are numbered (1, 2, 3, …), so a
+# single capital letter prefix is a reliable appendix signal. Require at
+# least two more tokens after the letter to rule out spurious short heads.
+_DEFAULT_APPENDIX_LETTER = r"^\s*[A-Z]\s+\S+(?:\s+\S+)+\s*$"
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +85,7 @@ class SectionPolicy:
             patterns.append(_DEFAULT_SUPPLEMENTARY)
         if self.skip_appendix:
             patterns.append(_DEFAULT_APPENDIX)
+            patterns.append(_DEFAULT_APPENDIX_LETTER)
         patterns.extend(self.extra_skip_patterns)
         return patterns
 

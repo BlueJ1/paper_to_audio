@@ -1,6 +1,19 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+
+Always update this file after relevant project changes.
+
+## Confirmed intent and audit status (2026-09-06)
+
+- The owner confirmed that this is a **personal local tool**. Hosted-service infrastructure is outside the current scope.
+- The intended output is **faithful prose with math/table narration**, omitting references and appendices. Do not introduce general paraphrasing or summarization of the paper's prose.
+- The current audit and prioritized implementation plan are in `AUDIT_AND_REPAIR_PLAN.md`. The audit changed documentation only; its listed code defects remain open.
+- Baseline: `.venv/bin/python -m pytest -q` passed **326 tests**, with no skips and five PyMuPDF/SWIG deprecation warnings. A short complete PDF → Kokoro MP3 CLI run and a separate two-worker Kokoro run both succeeded with Hugging Face/Transformers offline mode enabled. Cloud provider calls, a clean installation, browser interactions, and full-paper audio quality were not verified.
+- Tests currently concentrate on `pipeline/`; there are no dedicated CLI, Flask/UI, TTS, or legacy-cleanup suites. Passing corpus count checks does not establish narration fidelity.
+- Highest-priority confirmed defects: ordinary `A …` titles can trigger appendix filtering and delete the whole paper; grouped quantities such as `1,000 MB` are corrupted; the entry points' LLM controls never activate LLM policies. Before enabling those policies, protect surrounding prose and table facts from model changes.
+- Additional repair work covers rejected/empty narration, oversized TTS chunks, audio formats, web job state and recovery, optional dependencies, setup checks, and stale usage documentation. Consult the audit for reproductions and acceptance criteria.
+- The audit began with substantial existing modified and untracked source/test files. Preserve that work and include the necessary untracked files deliberately when preparing commits. Do not refresh corpus baselines merely to hide a regression.
 
 ## Project Overview
 
@@ -9,6 +22,8 @@ Converts academic papers (PDF) into audio files. Two-stage pipeline:
 2. **Text → Speech**: Uses either Murf.ai (cloud, paid) or Kokoro (local, free) TTS engine.
 
 Both `main.py` and `app.py` use `pipeline.run_pipeline()` + `pipeline.serialize()`. The legacy `pdf_to_text.py` still exists as a standalone script but is no longer wired into the main entry points.
+
+Current integration caveat: both entry points always pass `PipelineConfig()` with table, equation, and inline-math modes set to `skip`. They construct an LLM when requested, but the policies never call it. Cache, inspection, per-phase configuration, and vision-first processing exist as library APIs; they are not exposed by the entry points. These are current limitations, not the intended final behavior.
 
 ## Commands
 
@@ -53,7 +68,7 @@ python check_setup.py
 
 ## Pipeline (`pipeline/` package)
 
-Layout-aware PDF preprocessing pipeline. Keeps layout and font metadata end-to-end so each block can be routed to the right handler (prose, equation, table, caption, ...). Every stage is a pure function `Document -> Document`.
+Layout-aware PDF preprocessing pipeline. Keeps layout and font metadata end-to-end so each block can be routed to the right handler (prose, equation, table, caption, ...). The intended stage contract is a pure function `Document -> Document`, but `classify_blocks()` currently mutates its input blocks and returns the same document. Copy inputs before retaining independent classification snapshots until that contract is repaired.
 
 Module layout:
 
@@ -95,8 +110,8 @@ Phase 2 (`pipeline/classify.py`) — `classify_blocks(doc) -> Document`:
 
 Phase 3 (`pipeline/policies.py`) — `filter_sections(doc, policy) -> Document`:
 - `SectionPolicy` dataclass holds: `skip_kinds` (default `page_header, page_footer, footnote, toc, noise, figure`), per-section booleans (`skip_references`, `skip_acknowledgments`, `skip_author_contributions`, `skip_supplementary`, `skip_appendix`), `keep_code` (default False), and `extra_skip_patterns` for custom regexes.
-- `section_patterns()` assembles the effective regex list from the enabled booleans plus extras. Each canned pattern accepts an optional numeric or single-letter prefix so `6 References`, `6. References`, and `A Appendix` all match. `skip_appendix` additionally installs `_DEFAULT_APPENDIX_LETTER` — a single-capital + ≥2-token heading pattern that catches ICLR/NeurIPS-style lettered appendices (`A MULTIHEAD SELF-ATTENTION`, `C Long-term Memory Module (LMM) as a Sequence Model`) which never spell out the word "Appendix". Main body sections in those templates are numeric-prefixed, so the single-letter prefix is a reliable appendix tell.
-- Filtering walks blocks in order. A heading whose text matches a skip regex opens a skip at that heading's `level`; subsequent blocks are dropped until a later heading at level ≤ the skip level appears. Skip level defaults to 99 when `level is None`, so headings with unknown rank still end the skip as soon as any heading follows.
+- `section_patterns()` assembles the effective regex list from the enabled booleans plus extras. References, acknowledgments, and author-contribution patterns support an optional numeric or single-letter prefix. Appendix and supplementary patterns do not consistently support it: `A Appendix` and `6 Supplementary Material` currently fail to match. `skip_appendix` additionally installs `_DEFAULT_APPENDIX_LETTER`, which catches multi-token lettered appendices but also ordinary titles such as `A Novel Method for Learning`; a title at the highest heading level can therefore cause the entire paper to be dropped. This heuristic needs document context before it is reliable.
+- Filtering walks blocks in order. A heading whose text matches a skip regex opens a skip at that heading's `level`; subsequent blocks are dropped until a later heading with a known level ≤ the skip level appears. Skip level defaults to 99 when the opening heading has `level is None`; a later unknown-level heading does not close the skip. The intended unknown-level behavior needs an explicit regression test.
 - Parent-section fallback: non-heading blocks whose `parent_section` matches a skip pattern are dropped even if the level-based tracking missed them (guards against noisy heading levels per the drop-cap caveat above).
 - Pure function: returns a new `Document` via `dataclasses.replace`, so callers can A/B different policies against the same Phase 2 output.
 
@@ -164,7 +179,7 @@ Phase 9 (`pipeline/vlm.py`) — optional vision-first mode:
 - Caching: callers wrap `vision_llm` with `LLMCache.wrap_vision` BEFORE passing it in. The cache keys on `sha256(image_bytes)` so re-running on the same PDF with the same prompt is free. Errors are not cached, so flaky pages retry on next invocation.
 - Trade-offs vs the symbolic pipeline: one vision call per page (cost) and the VLM may paraphrase (fidelity) — but pathological layouts, scanned pages, and heavy-math papers all work in one shot. Intended as an opt-in fallback or as a reference output to diff Phases 1-6 against.
 
-All nine phases are shipped and wired into `main.py` and `app.py` via `run_pipeline()`. The legacy `pdf_to_text.py` is still runnable standalone but is no longer used by the main entry points.
+The symbolic stages are wired into `main.py` and `app.py` via `run_pipeline()`. Phase 8 cache/inspection utilities require explicit caller use. Phase 9 is a separate `run_pipeline_vlm()` library entry point; it is not called by either CLI or Flask. The legacy `pdf_to_text.py` is still runnable standalone and still supplies `build_llm()` to the main entry points.
 
 ## Testing
 

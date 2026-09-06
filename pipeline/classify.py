@@ -24,6 +24,13 @@ _CAPTION_RE = re.compile(
     r"^\s*(Figure|Fig\.?|Table|Algorithm)\s+\d+(\.\d+)?\s*[.:\s]",
     re.IGNORECASE,
 )
+# arXiv margin stamp: `arXiv:2501.00663v1 [cs.LG] 31 Dec 2024`. Pymupdf
+# sometimes reports this as oversized rotated text, fooling the heading
+# classifier; other times it lands at body size in the header band. Either
+# way it is metadata, not narration, so we drop it to noise up front.
+_ARXIV_HEADER_RE = re.compile(
+    r"^\s*arXiv:\s*\d{4}\.\d{4,5}(v\d+)?\b", re.IGNORECASE
+)
 _SECTION_NUM_RE = re.compile(r"^\d+(\.\d+)*\.?\s+\S")
 # 1–3 digit equation number at the right edge: "(3)" or "(3.4)".
 # Tight bound avoids matching citation years like "(2019)".
@@ -53,6 +60,11 @@ _HEADING_SIZE_RATIO = 1.05
 # Bold at/near body size also counts as a heading when it carries a structural
 # signal (e.g. "3.1 Long-term Memory" bolded at body size).
 _HEADING_BOLD_SIZE_RATIO = 0.95
+# All-caps standalone headings (ICLR/NeurIPS templates set sections in the body
+# font at body size, distinguished only by full uppercase). Require at least
+# body-size to avoid catching small-caps legends in figures.
+_HEADING_ALLCAPS_SIZE_RATIO = 0.95
+_HEADING_ALLCAPS_MAX_WORDS = 10
 _HEADING_MAX_CHARS = 160
 _HEADING_MAX_WORDS = 14
 # Block aspect ratios extreme enough to indicate rotated / sidebar text
@@ -93,6 +105,8 @@ def classify_blocks(doc: Document) -> Document:
 def _classify_block(b: Block, body_size: float, page_rects: list[BBox]) -> str:
     text = b.text.strip()
     if not text:
+        return "noise"
+    if _ARXIV_HEADER_RE.match(text):
         return "noise"
     if _CAPTION_RE.match(text):
         return "caption"
@@ -166,6 +180,17 @@ def _is_heading(b: Block, body_size: float) -> bool:
         and size_ratio >= _HEADING_BOLD_SIZE_RATIO
         and short
         and (numbered or all_caps)
+    ):
+        return True
+    # Path C — all-caps standalone heading at body size (ICLR/NeurIPS style:
+    # "ABSTRACT", "1 INTRODUCTION", "2 RELATED WORK" set in the body font).
+    # Needs enough letters to rule out stray caps fragments, and a short
+    # standalone line — body prose spilling into all-caps would be longer.
+    if (
+        all_caps
+        and size_ratio >= _HEADING_ALLCAPS_SIZE_RATIO
+        and len(words) <= _HEADING_ALLCAPS_MAX_WORDS
+        and len(letters) >= 3
     ):
         return True
     return False

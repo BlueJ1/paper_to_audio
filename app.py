@@ -6,11 +6,15 @@ import subprocess
 import sys
 import tempfile
 import threading
+import traceback
 import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template, request, send_file
+
+from pipeline import run_pipeline, serialize, PipelineConfig
+from pdf_to_text import build_llm
 
 load_dotenv()
 
@@ -34,6 +38,16 @@ def _new_job() -> tuple[str, dict]:
     return job_id, job
 
 
+def _wrap_langchain_llm(chat_model) -> callable:
+    """Adapt a LangChain BaseChatModel to the pipeline's Callable[[str], str]."""
+    def call(prompt: str) -> str:
+        result = chat_model.invoke(prompt)
+        if hasattr(result, "content"):
+            return str(result.content)
+        return str(result)
+    return call
+
+
 def _stream_process(proc: subprocess.Popen, job: dict) -> int:
     """Forward subprocess stdout to the job's queue."""
     for line in proc.stdout:
@@ -46,42 +60,25 @@ def _stream_process(proc: subprocess.Popen, job: dict) -> int:
 
 def _run_text_processing(job_id: str, use_llm: bool, llm_provider: str, llm_model: str) -> None:
     job = _jobs[job_id]
-    pdf_path = WORK_DIR / f"{job_id}.pdf"
-    text_path = WORK_DIR / f"{job_id}.txt"
-
-    cmd = [
-        sys.executable,
-        "-u",  # unbuffered stdout so logs stream live to the UI
-        str(PROJECT_DIR / "pdf_to_text.py"),
-        str(pdf_path),
-        "--out", str(text_path),
-    ]
-    if not use_llm:
-        cmd.append("--no-llm")
-    else:
-        cmd += ["--llm-provider", llm_provider, "--llm-model", llm_model]
+    pdf_path = str(WORK_DIR / f"{job_id}.pdf")
 
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,  # line-buffered on the read side
-            cwd=str(PROJECT_DIR),
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
-        )
-        rc = _stream_process(proc, job)
-        if rc != 0:
-            job["queue"].put({"type": "error", "message": f"Text processing failed (exit {rc})"})
-            return
+        llm = None
+        if use_llm:
+            job["queue"].put({"type": "log", "message": f"Building LLM ({llm_provider}:{llm_model})..."})
+            llm = _wrap_langchain_llm(build_llm(model=llm_model, provider=llm_provider))
 
-        text = text_path.read_text(encoding="utf-8")
+        job["queue"].put({"type": "log", "message": "Running pipeline (extract → classify → filter → polish)..."})
+        doc, _ = run_pipeline(pdf_path, config=PipelineConfig(), llm=llm)
+
+        job["queue"].put({"type": "log", "message": "Serializing text..."})
+        text = serialize(doc)
+
         job["text"] = text
         job["queue"].put({"type": "done", "text": text})
 
     except Exception as exc:
-        job["queue"].put({"type": "error", "message": str(exc)})
+        job["queue"].put({"type": "error", "message": traceback.format_exc()})
 
 
 def _run_audio_generation(job_id: str, text: str, tts_engine: str) -> None:

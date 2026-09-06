@@ -14,3 +14,4 @@ soundfile>=0.12.1
 numpy>=1.24.0
 pymupdf>=1.23.0
 pdfplumber>=0.11.0
+num2words>=0.5.13

@@ -66,7 +66,9 @@ def load_settings(tts_engine: str = "murf") -> Settings:
 def split_text(text: str, max_chars: int) -> List[str]:
     """Split text into chunks suitable for TTS processing."""
     # Split on paragraph boundaries, then fall back to sentence boundaries.
-    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+    paragraphs = [
+        " ".join(p.split()) for p in text.split("\n\n") if p.strip()
+    ]
     chunks: List[str] = []
     current: List[str] = []
     current_len = 0
@@ -74,7 +76,7 @@ def split_text(text: str, max_chars: int) -> List[str]:
     def flush():
         nonlocal current, current_len
         if current:
-            chunks.append("\n".join(current).strip())
+            chunks.append(" ".join(current).strip())
             current = []
             current_len = 0
 

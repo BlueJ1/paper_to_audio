@@ -162,6 +162,34 @@ class TestFilterBySection:
         assert len(out.blocks) == 1
         assert out.blocks[0].text.startswith("Conclusion")
 
+    def test_iclr_letter_prefixed_appendix_dropped(self):
+        """ICLR/NeurIPS appendix style: lettered, not named 'Appendix'."""
+        blocks = [
+            _block("Main body paragraph with plenty of words in it here."),
+            # All-caps form (ViT)
+            _block("A MULTIHEAD SELF-ATTENTION", kind="heading", level=1),
+            _block("Appendix A body content.",
+                   parent_section="A MULTIHEAD SELF-ATTENTION"),
+            # Title-case form (Titans)
+            _block("C Long-term Memory Module (LMM) as a Sequence Model",
+                   kind="heading", level=1),
+            _block("Appendix C body content.",
+                   parent_section="C Long-term Memory Module (LMM) as a Sequence Model"),
+        ]
+        out = filter_sections(_doc(blocks))
+        assert len(out.blocks) == 1
+        assert out.blocks[0].text.startswith("Main body")
+
+    def test_numbered_section_not_treated_as_appendix(self):
+        """A numeric-prefixed heading must NOT match the appendix-letter pattern."""
+        blocks = [
+            _block("2 RELATED WORK", kind="heading", level=1),
+            _block("Body of section 2.", parent_section="2 RELATED WORK"),
+        ]
+        out = filter_sections(_doc(blocks))
+        # Heading and its body both kept — numbered, not lettered.
+        assert len(out.blocks) == 2
+
     def test_keep_appendix_disables_appendix_skip(self):
         blocks = [
             _block("Appendix A", kind="heading", level=1),

@@ -7,9 +7,21 @@ import argparse
 import os
 import tempfile
 
-from pdf_to_text import load_pdf_text, build_llm, clean_for_tts, DEFAULT_LLM_MODEL, DEFAULT_CEREBRAS_MODEL
-from text_to_speech import load_settings, split_text, MurfTTSEngine, KokoroTTSEngine, concatenate_audio, Settings, generate_audio_chunks
 from dotenv import load_dotenv
+
+from pipeline import run_pipeline, serialize, PipelineConfig
+from pdf_to_text import build_llm, DEFAULT_LLM_MODEL, DEFAULT_CEREBRAS_MODEL
+from text_to_speech import load_settings, split_text, MurfTTSEngine, KokoroTTSEngine, concatenate_audio, Settings, generate_audio_chunks
+
+
+def _wrap_langchain_llm(chat_model) -> callable:
+    """Adapt a LangChain BaseChatModel to the pipeline's Callable[[str], str]."""
+    def call(prompt: str) -> str:
+        result = chat_model.invoke(prompt)
+        if hasattr(result, "content"):
+            return str(result.content)
+        return str(result)
+    return call
 
 
 def main() -> None:
@@ -64,7 +76,7 @@ def main() -> None:
     parser.add_argument(
         "--text-file",
         default=None,
-        help="Use existing text file instead of processing PDF (skips step 1-2)",
+        help="Use existing text file instead of processing PDF (skips PDF processing)",
     )
     args = parser.parse_args()
 
@@ -97,19 +109,25 @@ def main() -> None:
             pdf_basename = os.path.splitext(os.path.basename(args.pdf))[0]
             text_file = f"{pdf_basename}_audio_text.txt"
         else:
-            # Create temporary file
             temp_fd, text_file = tempfile.mkstemp(suffix=".txt", prefix="audio_text_")
-            os.close(temp_fd)  # Close the file descriptor
+            os.close(temp_fd)
 
-        # Step 1: Load PDF
+        # Step 1-2: Run the layout-aware pipeline
         print(f"[1/5] Loading PDF: {args.pdf}")
-        paper_text = load_pdf_text(args.pdf)
-        print(f"      Loaded {len(paper_text)} characters")
+        llm = None
+        if not args.no_llm:
+            print(
+                f"[2/5] Processing with pipeline (provider={args.llm_provider}, "
+                f"model={args.llm_model})..."
+            )
+            llm = _wrap_langchain_llm(
+                build_llm(model=args.llm_model, provider=args.llm_provider)
+            )
+        else:
+            print("[2/5] Processing with pipeline (no LLM, deterministic only)...")
 
-        # Step 2: Clean text for TTS (targeted replacements)
-        print("[2/5] Cleaning text for TTS...")
-        llm = None if args.no_llm else build_llm(model=args.llm_model, provider=args.llm_provider)
-        rewritten = clean_for_tts(paper_text, llm=llm)
+        doc, _ = run_pipeline(args.pdf, config=PipelineConfig(), llm=llm)
+        rewritten = serialize(doc)
         print(f"      Output: {len(rewritten)} characters of audio-friendly text")
 
         # Save intermediate text file
@@ -161,7 +179,7 @@ def main() -> None:
         except:
             pass
 
-    print(f"✓ Successfully saved audio to {args.out}")
+    print(f"Successfully saved audio to {args.out}")
 
 
 if __name__ == "__main__":
