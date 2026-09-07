@@ -187,7 +187,7 @@ def _encode_meta(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_encode_meta(v) for v in value]
     if isinstance(value, set):
-        return sorted(_encode_meta(v) for v in value)
+        return sorted((_encode_meta(v) for v in value), key=lambda v: (type(v).__name__, repr(v)))
     if isinstance(value, bytes):
         return f"<bytes len={len(value)}>"
     return repr(value)

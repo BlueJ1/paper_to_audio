@@ -30,18 +30,17 @@ _NUM_PREFIX = r"(?:\d+\.?\s+|[A-Z]\.?\s+)?"
 _DEFAULT_REFERENCES = rf"^\s*{_NUM_PREFIX}(references?|bibliograph(?:y|ies)|works?\s+cited)\s*$"
 _DEFAULT_ACKNOWLEDGMENTS = rf"^\s*{_NUM_PREFIX}acknowledge?ments?\s*$"
 _DEFAULT_AUTHOR_CONTRIB = rf"^\s*{_NUM_PREFIX}author\s+contributions?\s*$"
-_DEFAULT_SUPPLEMENTARY = r"^\s*supplement(?:ary|al)(?:\s+material)?.*$"
+_DEFAULT_SUPPLEMENTARY = rf"^\s*{_NUM_PREFIX}supplement(?:ary|al)(?:\s+material)?.*$"
 # "Appendix", "Appendix A", "Appendix A: Proofs", "Appendices", or bare
 # letter-numbered "A Proofs" when the heading starts with a single capital.
-_DEFAULT_APPENDIX = r"^\s*(?:appendix(?:\s+[A-Z0-9]\S*)?(?:[:\s].*)?|appendices)\s*$"
+_DEFAULT_APPENDIX = rf"^\s*{_NUM_PREFIX}(?:appendix(?:\s+[A-Z0-9]\S*)?(?:[:\s].*)?|appendices)\s*$"
 # ICLR/NeurIPS style: appendix sections lettered rather than named. Two
 # typographic conventions seen in practice:
 #   "A MULTIHEAD SELF-ATTENTION"                 (ViT — all caps)
 #   "C Long-term Memory Module (LMM) as a …"    (Titans — title case)
-# Main body sections in the same papers are numbered (1, 2, 3, …), so a
-# single capital letter prefix is a reliable appendix signal. Require at
-# least two more tokens after the letter to rule out spurious short heads.
-_DEFAULT_APPENDIX_LETTER = r"^\s*[A-Z]\s+\S+(?:\s+\S+)+\s*$"
+# Only apply this pattern after main-section/back-matter context is observed.
+# Dotted and short headings are valid: "A. Technical Details", "A Proofs".
+_DEFAULT_APPENDIX_LETTER = r"^\s*[A-Z](?:\.\d+)*\.?\s+\S.*$"
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +84,6 @@ class SectionPolicy:
             patterns.append(_DEFAULT_SUPPLEMENTARY)
         if self.skip_appendix:
             patterns.append(_DEFAULT_APPENDIX)
-            patterns.append(_DEFAULT_APPENDIX_LETTER)
         patterns.extend(self.extra_skip_patterns)
         return patterns
 
@@ -110,19 +108,35 @@ def filter_sections(doc: Document, policy: SectionPolicy | None = None) -> Docum
     kept: list[Block] = []
     active_skip_level: int | None = None
 
+    # A bare letter is ambiguous in front matter. Require a preceding main
+    # section or an explicit back-matter boundary before accepting it.
+    main_seen = False
+    back_matter = False
+    skipped_sections: set[str] = set()
+    letter_pattern = re.compile(_DEFAULT_APPENDIX_LETTER)
     for b in doc.blocks:
         if b.kind == "heading":
             # Close an active skip if this heading is at or above its level.
-            if active_skip_level is not None and b.level is not None:
-                if b.level <= active_skip_level:
+            if active_skip_level is not None:
+                if b.level is None or b.level <= active_skip_level:
                     active_skip_level = None
             # Open a new skip if the heading text matches.
-            if _matches_any(b.text.strip(), patterns):
+            text = b.text.strip()
+            explicit_skip = _matches_any(text, patterns)
+            letter_skip = (policy.skip_appendix and (main_seen or back_matter)
+                           and bool(letter_pattern.match(text)))
+            if explicit_skip or letter_skip:
+                skipped_sections.add(text)
+                back_matter = True
                 # Level may be None if Phase 2 couldn't rank it; treat as deep.
                 active_skip_level = b.level if b.level is not None else 99
                 continue
             if active_skip_level is not None:
                 continue
+            if re.match(r"^\d+(?:\.\d+)*\.?\s+", text) or re.match(
+                r"^(abstract|introduction|conclusions?)\b", text, re.I
+            ):
+                main_seen = True
             kept.append(b)
             continue
 
@@ -136,7 +150,7 @@ def filter_sections(doc: Document, policy: SectionPolicy | None = None) -> Docum
         # Parent-section fallback: guards against cases where a skip heading
         # was missed (e.g. classified as body) but its children still carry
         # the right parent_section. Safe because we only check non-headings.
-        if b.parent_section and _matches_any(b.parent_section, patterns):
+        if b.parent_section and (b.parent_section in skipped_sections or _matches_any(b.parent_section, patterns)):
             continue
         kept.append(b)
 

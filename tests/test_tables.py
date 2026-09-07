@@ -211,13 +211,13 @@ class TestRenderProse:
         out = render_table(t, TablePolicy(mode="prose"), llm=llm)
         assert "26.5" in out and "27.9" in out
 
-    def test_falls_back_to_skip_when_llm_missing(self):
+    def test_falls_back_to_source_cells_when_llm_missing(self):
         t = TableData(
             rows=[["Model", "BLEU"], ["Base", "26.5"]],
             page=0, bbox=(0, 0, 1, 1),
         )
         out = render_table(t, TablePolicy(mode="prose"), llm=None)
-        assert "see the paper" in out
+        assert out == "Model: Base; BLEU: 26.5."
 
     def test_rejects_invented_numeric_values(self):
         t = TableData(
@@ -228,23 +228,23 @@ class TestRenderProse:
         llm = lambda prompt: "The base model scored 99.9 BLEU."
         out = render_table(t, TablePolicy(mode="prose"), llm=llm)
         assert "99.9" not in out
-        assert "see the paper" in out
+        assert out == "Model: Base; BLEU: 26.5."
 
-    def test_allows_integer_counts_in_prose(self):
+    def test_rejects_unstructured_prose(self):
         t = TableData(
             rows=[["Model", "BLEU"], ["Base", "26.5"]],
             page=0, bbox=(0, 0, 1, 1),
         )
         llm = lambda prompt: "Three rows compare two approaches on BLEU."
         out = render_table(t, TablePolicy(mode="prose"), llm=llm)
-        assert out.startswith("Three rows")
+        assert out == "Model: Base; BLEU: 26.5."
 
     def test_falls_back_when_llm_raises(self):
         t = TableData(rows=[["a", "b"], ["1", "2"]], page=0, bbox=(0, 0, 1, 1))
         def broken(_):
             raise RuntimeError("API down")
         out = render_table(t, TablePolicy(mode="prose"), llm=broken)
-        assert "see the paper" in out
+        assert out == "a: 1; b: 2."
 
 
 class TestProseSafety:

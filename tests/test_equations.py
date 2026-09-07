@@ -149,7 +149,7 @@ class TestSymbolicRewrite:
 
     def test_whitespace_is_polished(self):
         out = _symbolic_rewrite("  x   +   y  ")
-        assert out == "x + y"
+        assert out == "x plus y"
 
 
 # ---------------------------------------------------------------------------

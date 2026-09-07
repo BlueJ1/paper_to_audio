@@ -1,227 +1,231 @@
-"""Web UI for Paper to Audio conversion."""
+"""Personal local web workflow with bounded, replayable processing attempts."""
 import json
 import os
-import queue
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
-import traceback
-import uuid
 from pathlib import Path
 
+import fitz
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template, request, send_file
+from werkzeug.exceptions import HTTPException
 
-from pipeline import run_pipeline, serialize, PipelineConfig
-from pdf_to_text import build_llm
+from jobs import JobError, JobManager
+from processing import process_pdf
 
 load_dotenv()
-
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
-
+app.config.update(MAX_CONTENT_LENGTH=50 * 1024 * 1024, MAX_TEXT_CHARS=2_000_000,
+                  AUDIO_TIMEOUT=1800)
 WORK_DIR = Path(tempfile.gettempdir()) / "paper_to_audio_ui"
-WORK_DIR.mkdir(exist_ok=True)
-
-PROJECT_DIR = Path(__file__).parent
-
-_jobs: dict = {}
-_jobs_lock = threading.Lock()
+PROJECT_DIR = Path(__file__).resolve().parent
+manager = JobManager(WORK_DIR)
 
 
-def _new_job() -> tuple[str, dict]:
-    job_id = str(uuid.uuid4())
-    job = {"status": "idle", "queue": queue.Queue(), "text": None, "audio_path": None}
-    with _jobs_lock:
-        _jobs[job_id] = job
-    return job_id, job
+@app.before_request
+def expire_jobs():
+    manager.cleanup()
 
 
-def _wrap_langchain_llm(chat_model) -> callable:
-    """Adapt a LangChain BaseChatModel to the pipeline's Callable[[str], str]."""
-    def call(prompt: str) -> str:
-        result = chat_model.invoke(prompt)
-        if hasattr(result, "content"):
-            return str(result.content)
-        return str(result)
-    return call
+@app.errorhandler(JobError)
+def job_error(exc):
+    return jsonify(error=str(exc)), exc.status
 
 
-def _stream_process(proc: subprocess.Popen, job: dict) -> int:
-    """Forward subprocess stdout to the job's queue."""
-    for line in proc.stdout:
-        stripped = line.rstrip()
-        if stripped:
-            job["queue"].put({"type": "log", "message": stripped})
-    proc.wait()
-    return proc.returncode
+@app.errorhandler(HTTPException)
+def http_error(exc):
+    return jsonify(error=exc.description), exc.code
 
 
-def _run_text_processing(job_id: str, use_llm: bool, llm_provider: str, llm_model: str) -> None:
-    job = _jobs[job_id]
-    pdf_path = str(WORK_DIR / f"{job_id}.pdf")
+@app.errorhandler(Exception)
+def server_error(exc):
+    app.logger.exception("Request failed")
+    return jsonify(error="Local operation failed; check available disk space and application logs."), 500
 
+
+def payload():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        raise JobError("Expected a JSON object")
+    return data
+
+
+def start(job_id, operation, work):
+    job, attempt = manager.begin(job_id, operation)
+    def execute():
+        try:
+            result = work(job, attempt)
+            manager.emit(job, attempt, {"type": "done", **result})
+        except Exception as exc:
+            app.logger.exception("Attempt %s failed", attempt.id)
+            manager.emit(job, attempt, {"type": "error", "message": str(exc)})
     try:
-        llm = None
-        if use_llm:
-            job["queue"].put({"type": "log", "message": f"Building LLM ({llm_provider}:{llm_model})..."})
-            llm = _wrap_langchain_llm(build_llm(model=llm_model, provider=llm_provider))
-
-        job["queue"].put({"type": "log", "message": "Running pipeline (extract → classify → filter → polish)..."})
-        doc, _ = run_pipeline(pdf_path, config=PipelineConfig(), llm=llm)
-
-        job["queue"].put({"type": "log", "message": "Serializing text..."})
-        text = serialize(doc)
-
-        job["text"] = text
-        job["queue"].put({"type": "done", "text": text})
-
+        threading.Thread(target=execute, daemon=True).start()
     except Exception as exc:
-        job["queue"].put({"type": "error", "message": traceback.format_exc()})
+        manager.emit(job, attempt, {"type": "error", "message": str(exc)})
+        raise JobError("Could not start local worker", 503) from exc
+    return jsonify(ok=True, attempt_id=attempt.id,
+                   stream_url=f"/stream/{job_id}/{attempt.id}",
+                   status_url=f"/status/{job_id}/{attempt.id}"), 202
 
 
-def _run_audio_generation(job_id: str, text: str, tts_engine: str) -> None:
-    job = _jobs[job_id]
-    text_path = WORK_DIR / f"{job_id}_edit.txt"
-    audio_path = WORK_DIR / f"{job_id}.mp3"
+def _run_text_processing(job, attempt, use_llm, provider, model):
+    text, report = process_pdf(job.directory / "source.pdf", use_llm, provider, model)
+    (job.directory / f"{attempt.id}.json").write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+    for notice in report["warnings"]:
+        manager.emit(job, attempt, {"type": "log", "message": notice})
+    return {"text": text, "warnings": report["warnings"],
+            "inspection_url": f"/inspection/{job.id}/{attempt.id}"}
 
-    text_path.write_text(text, encoding="utf-8")
 
-    cmd = [
-        sys.executable,
-        "-u",  # unbuffered stdout so logs stream live to the UI
-        str(PROJECT_DIR / "text_to_speech.py"),
-        str(text_path),
-        "--out", str(audio_path),
-        "--tts-engine", tts_engine,
-    ]
-
+def _run_audio_generation(job, attempt, text, engine):
+    text_path = job.directory / f"{attempt.id}.txt"
+    audio_path = job.directory / f"{attempt.id}.mp3"
+    proc = None
+    timer = None
+    timed_out = threading.Event()
+    def stop_process():
+        timed_out.set()
+        if proc is not None and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
     try:
+        text_path.write_text(text, encoding="utf-8")
         proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,  # line-buffered on the read side
-            cwd=str(PROJECT_DIR),
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
-        )
-        rc = _stream_process(proc, job)
-        if rc != 0:
-            job["queue"].put({"type": "error", "message": f"Audio generation failed (exit {rc})"})
-            return
+            [sys.executable, "-u", str(PROJECT_DIR / "text_to_speech.py"), str(text_path),
+             "--out", str(audio_path), "--tts-engine", engine],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            cwd=PROJECT_DIR, start_new_session=True)
+        timer = threading.Timer(app.config["AUDIO_TIMEOUT"], stop_process)
+        timer.daemon = True
+        timer.start()
+        for line in proc.stdout:
+            if line.strip():
+                manager.emit(job, attempt, {"type": "log", "message": line.rstrip()[:4000]})
+        rc = proc.wait()
+        if timed_out.is_set():
+            raise RuntimeError("Audio generation timed out; try a shorter transcript or fewer workers")
+        if rc != 0 or not audio_path.is_file() or not audio_path.stat().st_size:
+            raise RuntimeError(f"Audio generation failed (exit {rc})")
+        return {"audio_url": f"/audio/{job.id}/{attempt.id}"}
+    finally:
+        if timer:
+            timer.cancel()
+        if proc is not None:
+            if proc.poll() is None:
+                stop_process()
+                proc.wait()
+            if proc.stdout:
+                proc.stdout.close()
+        text_path.unlink(missing_ok=True)
 
-        job["audio_path"] = str(audio_path)
-        job["queue"].put({"type": "done", "audio_url": f"/audio/{job_id}"})
 
-    except Exception as exc:
-        job["queue"].put({"type": "error", "message": str(exc)})
-
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-
-@app.route("/")
+@app.get("/")
 def index():
     return render_template("index.html")
 
 
-@app.route("/upload", methods=["POST"])
+@app.post("/upload")
 def upload():
-    if "pdf" not in request.files:
-        return jsonify({"error": "No file provided"}), 400
-    f = request.files["pdf"]
-    if not f.filename or not f.filename.lower().endswith(".pdf"):
-        return jsonify({"error": "File must be a PDF"}), 400
-
-    job_id, _ = _new_job()
-    f.save(str(WORK_DIR / f"{job_id}.pdf"))
-    return jsonify({"job_id": job_id, "filename": f.filename})
-
-
-@app.route("/process-text/<job_id>", methods=["POST"])
-def process_text(job_id: str):
-    if job_id not in _jobs:
-        return jsonify({"error": "Job not found"}), 404
-    data = request.get_json() or {}
-    use_llm = bool(data.get("use_llm", False))
-    # The UI sends "provider:model" (e.g. "google:gemma-3-27b-it",
-    # "cerebras:qwen-3-235b-a22b-instruct-2507"). Fall back to Google default.
-    llm_choice = data.get("llm_model", "google:gemma-3-27b-it")
-    if ":" in llm_choice:
-        llm_provider, llm_model = llm_choice.split(":", 1)
-    else:
-        llm_provider, llm_model = "google", llm_choice
-    job = _jobs[job_id]
-    job["queue"] = queue.Queue()
-    job["status"] = "processing_text"
-    threading.Thread(
-        target=_run_text_processing,
-        args=(job_id, use_llm, llm_provider, llm_model),
-        daemon=True,
-    ).start()
-    return jsonify({"ok": True})
+    file = request.files.get("pdf")
+    if not file or not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise JobError("Select a PDF file")
+    job = manager.create()
+    try:
+        path = job.directory / "source.pdf"
+        file.save(path)
+        with fitz.open(path) as pdf:
+            if not pdf.is_pdf or pdf.needs_pass or len(pdf) == 0:
+                raise ValueError("Unreadable or password-protected PDF")
+            # Load each page to catch broken page trees without requiring text.
+            for page in pdf:
+                _ = page.rect
+    except Exception as exc:
+        manager.delete(job.id)
+        if isinstance(exc, OSError):
+            raise
+        raise JobError("File is not a readable, unencrypted PDF") from exc
+    return jsonify(job_id=job.id, filename=file.filename)
 
 
-@app.route("/generate-audio/<job_id>", methods=["POST"])
-def generate_audio(job_id: str):
-    if job_id not in _jobs:
-        return jsonify({"error": "Job not found"}), 404
-    data = request.get_json() or {}
-    text = data.get("text", "").strip()
-    tts_engine = data.get("tts_engine", "kokoro")
-    if not text:
-        return jsonify({"error": "No text provided"}), 400
-    job = _jobs[job_id]
-    job["queue"] = queue.Queue()
-    job["status"] = "generating_audio"
-    threading.Thread(
-        target=_run_audio_generation, args=(job_id, text, tts_engine), daemon=True
-    ).start()
-    return jsonify({"ok": True})
+@app.post("/process-text/<job_id>")
+def process_text(job_id):
+    manager.get(job_id)
+    data = payload()
+    use_llm = data.get("use_llm", False)
+    choice = data.get("llm_model", "google:gemma-3-27b-it")
+    if type(use_llm) is not bool or not isinstance(choice, str) or not choice.strip() or len(choice) > 200:
+        raise JobError("use_llm must be a boolean and llm_model a nonempty string")
+    provider, model = choice.split(":", 1) if ":" in choice else ("google", choice)
+    if provider not in {"google", "cerebras"} or not model.strip():
+        raise JobError("Invalid model/provider choice")
+    return start(job_id, "text processing", lambda j, a: _run_text_processing(j, a, use_llm, provider, model))
 
 
-@app.route("/stream/<job_id>")
-def stream(job_id: str):
-    if job_id not in _jobs:
-        return jsonify({"error": "Job not found"}), 404
-    job = _jobs[job_id]
+@app.post("/generate-audio/<job_id>")
+def generate_audio(job_id):
+    manager.get(job_id)
+    data = payload()
+    text, engine = data.get("text"), data.get("tts_engine", "kokoro")
+    if not isinstance(text, str) or not text.strip() or len(text) > app.config["MAX_TEXT_CHARS"]:
+        raise JobError("Provide nonempty text within the 2,000,000 character limit")
+    if not isinstance(engine, str) or engine not in {"kokoro", "murf"}:
+        raise JobError("Invalid TTS engine")
+    return start(job_id, "audio generation", lambda j, a: _run_audio_generation(j, a, text.strip(), engine))
 
+
+@app.get("/status/<job_id>")
+@app.get("/status/<job_id>/<attempt_id>")
+def status(job_id, attempt_id=None):
+    return jsonify(manager.snapshot(job_id, attempt_id))
+
+
+@app.get("/stream/<job_id>/<attempt_id>")
+def stream(job_id, attempt_id):
+    job, attempt = manager.attempt(job_id, attempt_id)
+    try:
+        after = int(request.headers.get("Last-Event-ID", request.args.get("after", "0")))
+        if not 0 <= after <= attempt.sequence:
+            raise ValueError()
+    except ValueError:
+        raise JobError("Invalid event cursor")
     def generate():
-        while True:
-            try:
-                msg = job["queue"].get(timeout=30)
-                yield f"data: {json.dumps(msg)}\n\n"
-                if msg["type"] in ("done", "error"):
-                    break
-            except queue.Empty:
-                # Keep-alive ping
-                yield 'data: {"type":"ping"}\n\n'
-
-    return Response(
-        generate(),
-        mimetype="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+        for sequence, event in manager.events(job, attempt, after):
+            prefix = f"id: {sequence}\n" if sequence is not None else ""
+            yield f"{prefix}data: {json.dumps(event)}\n\n"
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-@app.route("/audio/<job_id>")
-def serve_audio(job_id: str):
-    if job_id not in _jobs:
-        return jsonify({"error": "Not found"}), 404
-    path = _jobs[job_id].get("audio_path")
-    if not path or not os.path.exists(path):
-        return jsonify({"error": "Audio not ready"}), 404
-    as_attachment = request.args.get("download") == "1"
-    return send_file(
-        path,
-        mimetype="audio/mpeg",
-        as_attachment=as_attachment,
-        download_name="paper_audio.mp3",
-    )
+@app.get("/audio/<job_id>/<attempt_id>")
+def serve_audio(job_id, attempt_id):
+    job, attempt = manager.attempt(job_id, attempt_id)
+    path = job.directory / f"{attempt.id}.mp3"
+    if attempt.status != "done" or not attempt.result.get("audio_url") or not path.is_file():
+        raise JobError("This attempt has no completed audio", 404)
+    return send_file(path, mimetype="audio/mpeg", as_attachment=request.args.get("download") == "1",
+                     download_name="paper_audio.mp3")
+
+
+@app.get("/inspection/<job_id>/<attempt_id>")
+def inspection(job_id, attempt_id):
+    job, attempt = manager.attempt(job_id, attempt_id)
+    path = job.directory / f"{attempt.id}.json"
+    if attempt.status != "done" or not path.is_file():
+        raise JobError("Inspection not ready", 404)
+    return send_file(path, mimetype="application/json", as_attachment=True)
+
+
+@app.delete("/jobs/<job_id>")
+def delete_job(job_id):
+    manager.delete(job_id)
+    return jsonify(ok=True)
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000, threaded=True)
+    app.run(host="127.0.0.1", debug=False, port=5000, threaded=True)

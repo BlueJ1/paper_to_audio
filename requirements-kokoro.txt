@@ -1,0 +1,7 @@
+-r requirements.txt
+kokoro==0.9.4
+torch==2.10.0
+numpy==2.4.1
+soundfile==0.13.1
+# English pronunciation model used by Kokoro/Misaki (official spaCy release).
+en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl

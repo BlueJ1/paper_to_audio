@@ -1,14 +1,21 @@
-"""Minimal Document -> text serializer.
+"""Final narration eligibility, independent of earlier filtering stages."""
+from pipeline.model import Block, Document
 
-Phase 1 uses this as a diffing tool against the legacy flat-string extraction.
-Later phases replace it with a kind-dispatching walker (prose -> prose,
-equation -> narrated prose, etc.).
-"""
-from __future__ import annotations
+REJECTED_KINDS = frozenset({"noise", "figure", "page_header", "page_footer", "toc", "footnote"})
 
-from pipeline.model import Document
+
+def is_narratable(block: Block) -> bool:
+    return bool(block.text.strip() and block.kind not in REJECTED_KINDS
+                and not block.meta.get("handler_error"))
 
 
 def serialize(doc: Document) -> str:
-    """Flatten a `Document` to plain text, one paragraph per block."""
-    return "\n\n".join(b.text for b in doc.blocks if b.text.strip())
+    """Keep diagnostics in the document, but never speak rejected content."""
+    return "\n\n".join(b.text for b in doc.blocks if is_narratable(b))
+
+
+def require_narration(text: str) -> str:
+    if not text.strip():
+        raise ValueError("No usable narration was extracted. For scanned PDFs, use OCR first "
+                         "or explicitly select the vision library API; no paid processing was started automatically.")
+    return text

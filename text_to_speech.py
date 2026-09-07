@@ -2,7 +2,13 @@
 Text to Speech Generator
 Converts audio-friendly text into speech using TTS engines (Murf.ai or Kokoro).
 """
+from __future__ import annotations
+
 import argparse
+import tempfile
+from bisect import bisect_right
+from pathlib import Path
+from dataclasses import replace
 import io
 import os
 import re
@@ -15,9 +21,6 @@ import requests
 from dotenv import load_dotenv
 from pydub import AudioSegment
 
-from kokoro import KPipeline
-import numpy as np
-import soundfile as sf
 
 
 class TTSEngine(Protocol):
@@ -52,7 +55,7 @@ def load_settings(tts_engine: str = "murf") -> Settings:
     kokoro_voice = os.getenv("KOKORO_VOICE", "af_bella").strip() or "af_bella"
     kokoro_workers = int(os.getenv("KOKORO_WORKERS", "1").strip() or "1")
 
-    return Settings(
+    settings = Settings(
         tts_engine=tts_engine,
         murf_api_key=murf_api_key,
         murf_voice_id=murf_voice_id,
@@ -61,45 +64,54 @@ def load_settings(tts_engine: str = "murf") -> Settings:
         kokoro_voice=kokoro_voice,
         kokoro_workers=kokoro_workers,
     )
+    validate_settings(settings)
+    return settings
+
+
+def validate_settings(settings: Settings, workers=None):
+    if settings.tts_engine not in {"kokoro", "murf"}:
+        raise ValueError("Unknown TTS engine")
+    if settings.murf_format.lower() not in {"mp3", "wav", "flac", "ogg"}:
+        raise ValueError("Unsupported MURF_FORMAT; use mp3, wav, flac, or ogg")
+    for label, value in (("Chunk limit", settings.murf_chunk_chars),
+                         ("Worker count", settings.kokoro_workers if workers is None else workers)):
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{label} must be a positive integer")
+
 
 
 def split_text(text: str, max_chars: int) -> List[str]:
     """Split text into chunks suitable for TTS processing."""
-    # Split on paragraph boundaries, then fall back to sentence boundaries.
-    paragraphs = [
-        " ".join(p.split()) for p in text.split("\n\n") if p.strip()
-    ]
-    chunks: List[str] = []
-    current: List[str] = []
-    current_len = 0
-
-    def flush():
-        nonlocal current, current_len
-        if current:
-            chunks.append(" ".join(current).strip())
-            current = []
-            current_len = 0
-
-    sentence_split = re.compile(r"(?<=[.!?])\s+")
-
-    for paragraph in paragraphs:
-        if len(paragraph) > max_chars:
-            # Paragraph too large; split into sentences.
-            sentences = sentence_split.split(paragraph)
-            for sentence in sentences:
-                if current_len + len(sentence) + 1 > max_chars:
-                    flush()
-                current.append(sentence)
-                current_len += len(sentence) + 1
-            continue
-
-        if current_len + len(paragraph) + 2 > max_chars:
-            flush()
-        current.append(paragraph)
-        current_len += len(paragraph) + 2
-
-    flush()
-    return [chunk for chunk in chunks if chunk]
+    if type(max_chars) is not int or max_chars <= 0:
+        raise ValueError("Chunk limit must be a positive integer")
+    paragraphs = [" ".join(p.split()) for p in re.split(r"\n\s*\n", text) if p.strip()]
+    normalized = " ".join(paragraphs)
+    paragraph_ends = []
+    offset = 0
+    for paragraph in paragraphs[:-1]:
+        offset += len(paragraph) + 1
+        paragraph_ends.append(offset)
+    sentence_ends = [m.end() for m in re.finditer(r"[.!?] +", normalized)]
+    chunks = []
+    start = 0
+    while start < len(normalized):
+        stop = min(start + max_chars, len(normalized))
+        if stop < len(normalized):
+            boundary = None
+            for boundaries in (paragraph_ends, sentence_ends):
+                index = bisect_right(boundaries, stop) - 1
+                if index >= 0 and boundaries[index] > start:
+                    boundary = boundaries[index]
+                    break
+            if boundary is not None:
+                stop = boundary
+            else:
+                space = normalized.rfind(" ", start, stop)
+                if space > start:
+                    stop = space + 1
+        chunks.append(normalized[start:stop])
+        start = stop
+    return chunks
 
 
 class MurfTTSEngine:
@@ -118,7 +130,7 @@ class MurfTTSEngine:
         payload = {
             "voiceId": self.settings.murf_voice_id,
             "text": text,
-            "format": self.settings.murf_format,
+            "format": self.settings.murf_format.upper(),
         }
         response = requests.post(url, headers=headers, json=payload, timeout=120)
         response.raise_for_status()
@@ -130,6 +142,18 @@ class MurfTTSEngine:
         audio_response = requests.get(audio_url, timeout=120)
         audio_response.raise_for_status()
         return audio_response.content
+
+
+def _load_kokoro_pipeline():
+    # Misaki otherwise invokes pip implicitly, even with HF offline mode set.
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        version("en-core-web-sm")
+    except PackageNotFoundError as exc:
+        raise RuntimeError("Kokoro needs its English pronunciation model. Run: "
+                           "python -m pip install -r requirements-kokoro.txt -c constraints.txt") from exc
+    from kokoro import KPipeline
+    return KPipeline(lang_code="a", repo_id="hexgrad/Kokoro-82M")
 
 
 class KokoroTTSEngine:
@@ -144,7 +168,7 @@ class KokoroTTSEngine:
         """Load the Kokoro model from HuggingFace."""
         try:
             # Kokoro uses a phonemizer; ensure it is available on the system.
-            self.pipeline = KPipeline(lang_code="a")
+            self.pipeline = _load_kokoro_pipeline()
         except Exception as e:
             if "espeak" in str(e).lower():
                 raise RuntimeError(
@@ -164,6 +188,8 @@ _KOKORO_VOICE: Optional[str] = None
 
 def _kokoro_generate_bytes(pipeline: KPipeline, voice: str, text: str) -> bytes:
     """Generate speech using Kokoro pipeline and return MP3 bytes."""
+    import numpy as np
+    import soundfile as sf
     generator = pipeline(text, voice=voice)
 
     audio_chunks = []
@@ -189,7 +215,7 @@ def _kokoro_generate_bytes(pipeline: KPipeline, voice: str, text: str) -> bytes:
 
 def _kokoro_worker_init(voice: str) -> None:
     global _KOKORO_PIPELINE, _KOKORO_VOICE
-    _KOKORO_PIPELINE = KPipeline(lang_code="a")
+    _KOKORO_PIPELINE = _load_kokoro_pipeline()
     _KOKORO_VOICE = voice
 
 
@@ -238,6 +264,9 @@ def generate_audio_chunks(
     kokoro_workers: int,
 ) -> List[bytes]:
     """Generate audio for all chunks, optionally in parallel for Kokoro."""
+    validate_settings(settings, kokoro_workers)
+    if not chunks or any(not c.strip() or len(c) > settings.murf_chunk_chars for c in chunks):
+        raise ValueError("Audio requires nonempty text chunks within the configured limit")
     if settings.tts_engine == "kokoro" and kokoro_workers > 1:
         print(f"      Using {kokoro_workers} parallel workers for Kokoro...")
         return _generate_kokoro_parallel(chunks, settings.kokoro_voice, kokoro_workers)
@@ -252,17 +281,40 @@ def generate_audio_chunks(
     return audio_chunks
 
 
-def concatenate_audio(chunks: Iterable[bytes], output_path: str) -> None:
-    """Properly concatenate audio chunks using pydub to maintain correct duration metadata."""
+def concatenate_audio(chunks: Iterable[bytes], output_path: str, input_format="mp3") -> None:
+    """Decode all chunks, then atomically publish a validated MP3."""
     combined = AudioSegment.empty()
+    for chunk in chunks:
+        segment = AudioSegment.from_file(io.BytesIO(chunk), format=input_format.lower())
+        if len(segment) == 0:
+            raise ValueError("Empty audio chunk")
+        combined += segment
+    if not len(combined):
+        raise ValueError("No audio generated")
+    destination = Path(output_path).resolve()
+    fd, temporary = tempfile.mkstemp(prefix=".audio-", suffix=".mp3", dir=destination.parent)
+    os.close(fd)
+    try:
+        combined.export(temporary, format="mp3", bitrate="128k").close()
+        if not len(AudioSegment.from_mp3(temporary)):
+            raise ValueError("Final audio is empty")
+        os.replace(temporary, destination)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
-    for chunk_bytes in chunks:
-        # Load each chunk as an AudioSegment
-        audio_segment = AudioSegment.from_file(io.BytesIO(chunk_bytes), format="mp3")
-        combined += audio_segment
 
-    # Export with proper metadata
-    combined.export(output_path, format="mp3", bitrate="128k")
+def synthesize(text, output, settings, workers=None):
+    validate_settings(settings, workers)
+    chunks = [chunk for chunk in split_text(text, settings.murf_chunk_chars) if chunk.strip()]
+    if not chunks:
+        raise ValueError("No usable text to speak")
+    workers = settings.kokoro_workers if workers is None else workers
+    if settings.tts_engine == "kokoro":
+        engine = None if workers > 1 else KokoroTTSEngine(settings)
+    else:
+        engine = MurfTTSEngine(settings)
+    audio = generate_audio_chunks(chunks, settings, engine, workers)
+    concatenate_audio(audio, output, "mp3" if settings.tts_engine == "kokoro" else settings.murf_format)
 
 
 def main() -> None:
@@ -303,45 +355,17 @@ def main() -> None:
             text_basename = text_basename[:-11]
         args.out = f"{text_basename}.mp3"
 
+    for value in (args.max_chars, args.kokoro_workers):
+        if value is not None and value <= 0:
+            parser.error("Chunk limit and worker count must be positive")
+    text = Path(args.text_file).read_text(encoding="utf-8")
+    if not text.strip():
+        parser.error("No usable text to speak")
     settings = load_settings(tts_engine=args.tts_engine)
-    if args.max_chars:
-        settings = Settings(
-            tts_engine=settings.tts_engine,
-            murf_api_key=settings.murf_api_key,
-            murf_voice_id=settings.murf_voice_id,
-            murf_format=settings.murf_format,
-            murf_chunk_chars=args.max_chars,
-            kokoro_voice=settings.kokoro_voice,
-            kokoro_workers=settings.kokoro_workers,
-        )
-
-    kokoro_workers = (
-        args.kokoro_workers if args.kokoro_workers is not None else settings.kokoro_workers
-    )
-
-    print(f"[1/4] Loading text from: {args.text_file}")
-    with open(args.text_file, "r", encoding="utf-8") as f:
-        text = f.read()
-    print(f"      Loaded {len(text)} characters")
-
-    print(f"[2/4] Splitting into chunks (max {settings.murf_chunk_chars} chars each)...")
-    chunks = split_text(text, settings.murf_chunk_chars)
-    print(f"      Created {len(chunks)} chunks")
-
-    # Initialize the appropriate TTS engine
-    if args.tts_engine == "kokoro":
-        print(f"[3/4] Generating audio with Kokoro (voice: {settings.kokoro_voice}, local)...")
-        tts_engine = None if kokoro_workers > 1 else KokoroTTSEngine(settings)
-    else:
-        print(f"[3/4] Generating audio with Murf.ai (voice: {settings.murf_voice_id})...")
-        tts_engine = MurfTTSEngine(settings)
-
-    audio_chunks = generate_audio_chunks(chunks, settings, tts_engine, kokoro_workers)
-
-    print(f"[4/4] Saving audio to {args.out}...")
-    concatenate_audio(audio_chunks, args.out)
-
-    print(f"✓ Successfully saved audio to {args.out}")
+    if args.max_chars is not None:
+        settings = replace(settings, murf_chunk_chars=args.max_chars)
+    synthesize(text, args.out, settings, args.kokoro_workers)
+    print(f"Successfully saved audio to {args.out}")
 
 
 if __name__ == "__main__":

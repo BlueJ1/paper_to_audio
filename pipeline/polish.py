@@ -380,7 +380,7 @@ def _apply_units(text: str, policy: PolishPolicy) -> str:
     # Build a single alternation, longest first so `GHz` beats `Hz`.
     keys = sorted(table.keys(), key=len, reverse=True)
     pattern = re.compile(
-        r"(?<!\w)(-?\d+(?:\.\d+)?)\s*(" + "|".join(re.escape(k) for k in keys) + r")(?!\w)"
+        r"(?<![\w.,])(-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)\s*(" + "|".join(re.escape(k) for k in keys) + r")(?!\w)"
     )
 
     def _sub(m: re.Match) -> str:
@@ -388,7 +388,7 @@ def _apply_units(text: str, policy: PolishPolicy) -> str:
         unit = m.group(2)
         spoken_number = _spell_number(number_text, policy)
         singular = table[unit]
-        word = singular if number_text in ("1", "1.0", "-1") else singular + "s"
+        word = singular if abs(float(number_text.replace(",", ""))) == 1 else singular + "s"
         return f"{spoken_number} {word}"
 
     return pattern.sub(_sub, text)
@@ -403,7 +403,7 @@ def _apply_units(text: str, policy: PolishPolicy) -> str:
 # decimal. Anchored with non-word boundaries so we don't touch the digit
 # inside identifiers like `H2O` or `x_3` (the latter has no leading word
 # char, but `_` is a word char so the `(?<!\w)` already excludes it).
-_NUMBER_RE = re.compile(r"(?<![\w.])(-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|-?\d+(?:\.\d+)?)(?![\w.])")
+_NUMBER_RE = re.compile(r"(?<![\w.])(-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|-?\d+(?:\.\d+)?)(?!\w|\.\d)")
 
 
 def _apply_numbers(text: str, policy: PolishPolicy) -> str:
@@ -473,10 +473,11 @@ def to_ssml(doc: Document, policy: PolishPolicy | None = None) -> str:
     noise, so callers must opt in deliberately.
     """
     policy = policy or PolishPolicy()
+    from pipeline.serialize import is_narratable
     parts: list[str] = ["<speak>"]
     first_block = True
     for b in doc.blocks:
-        if not b.text.strip() or b.kind in policy.skip_kinds:
+        if not is_narratable(b) or b.kind in policy.skip_kinds:
             continue
         if b.kind == "heading" and not first_block:
             parts.append(

@@ -178,20 +178,20 @@ class TestArXivHeader:
         # `cs.L G` from the acronym rule).
         b = _block("arXiv:2501.00663v1 [cs.LG] 31 Dec 2024")
         d = _doc([b])
-        classify_blocks(d)
+        d = classify_blocks(d)
         assert d.blocks[0].kind == "noise"
 
     def test_arxiv_header_with_two_column_paper(self):
         b = _block("arXiv:1803.02155v2  [cs.CL]  12 Apr 2018")
         d = _doc([b])
-        classify_blocks(d)
+        d = classify_blocks(d)
         assert d.blocks[0].kind == "noise"
 
     def test_not_arxiv_but_mentions_arxiv_stays_body(self):
         # Body prose that happens to contain "arXiv" should not be noised.
         b = _block("We uploaded a pre-print to the arXiv repository last year.")
         d = _doc([b])
-        classify_blocks(d)
+        d = classify_blocks(d)
         assert d.blocks[0].kind == "body"
 
 
@@ -219,7 +219,7 @@ class TestClassifyBlocks:
     def test_caption_takes_precedence_over_heading(self):
         # Big font + "Figure 1:" — caption regex wins.
         b = _block("Figure 1: The architecture.", size=12.0)
-        classify_blocks(_doc([b]))
+        b = classify_blocks(_doc([b])).blocks[0]
         assert b.kind == "caption"
 
     def test_builds_section_tree(self):
@@ -229,7 +229,7 @@ class TestClassifyBlocks:
         h2 = _block("2 Method", size=12.0)
         p3 = _block("We propose a novel approach with several parts.")
         doc = _doc([h1, p1, p2, h2, p3])
-        classify_blocks(doc)
+        h1, p1, p2, h2, p3 = classify_blocks(doc).blocks
         assert h1.kind == "heading"
         assert h2.kind == "heading"
         assert p1.kind == "body"
@@ -243,7 +243,7 @@ class TestClassifyBlocks:
         sub = _block("1.1 Subsection", size=11.8)
         body = _block("Plain body paragraph with many words in it.")
         doc = _doc([title, sec, sub, body])
-        classify_blocks(doc)
+        title, sec, sub, body = classify_blocks(doc).blocks
         assert title.level == 1
         assert sec.level == 2
         assert sub.level == 3
@@ -265,8 +265,8 @@ class TestClassifyBlocks:
             )
             blocks.extend([hdr, body])
         doc = _doc(blocks, page_rects=page_rects)
-        classify_blocks(doc)
-        headers = [b for b in blocks if b.kind == "page_header"]
+        out = classify_blocks(doc)
+        headers = [b for b in out.blocks if b.kind == "page_header"]
         assert len(headers) == 4
 
     def test_non_repeating_top_block_is_not_marked_header(self):
