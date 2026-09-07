@@ -165,6 +165,7 @@ class TestFilterBySection:
     def test_iclr_letter_prefixed_appendix_dropped(self):
         """ICLR/NeurIPS appendix style: lettered, not named 'Appendix'."""
         blocks = [
+            _block("1 Introduction", kind="heading", level=1),
             _block("Main body paragraph with plenty of words in it here."),
             # All-caps form (ViT)
             _block("A MULTIHEAD SELF-ATTENTION", kind="heading", level=1),
@@ -177,8 +178,8 @@ class TestFilterBySection:
                    parent_section="C Long-term Memory Module (LMM) as a Sequence Model"),
         ]
         out = filter_sections(_doc(blocks))
-        assert len(out.blocks) == 1
-        assert out.blocks[0].text.startswith("Main body")
+        assert len(out.blocks) == 2
+        assert out.blocks[1].text.startswith("Main body")
 
     def test_numbered_section_not_treated_as_appendix(self):
         """A numeric-prefixed heading must NOT match the appendix-letter pattern."""

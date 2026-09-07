@@ -1,314 +1,38 @@
-# Modular Pipeline Usage Guide
+# Code and library guide
 
-This guide explains the modular architecture and how to use the three scripts independently or together.
+`main.py` and Flask's `app.py` both use `processing.process_pdf()`. `providers.py` lazily constructs only the selected provider and adapts text responses. `processing.build_config()` defines entry-point narration defaults. Library `PipelineConfig()` defaults remain unchanged for backwards compatibility.
 
-## Architecture Overview
+```python
+from processing import process_pdf
 
-```
-┌─────────────┐     ┌──────────────────┐     ┌──────────────┐
-│             │     │                  │     │              │
-│   PDF File  │────►│  pdf_to_text.py  │────►│  Text File   │
-│             │     │  (Uses Gemini)   │     │              │
-└─────────────┘     └──────────────────┘     └──────┬───────┘
-                                                     │
-                                                     │
-                    ┌──────────────────────┐         │
-                    │                      │         │
-                    │  text_to_speech.py   │◄────────┘
-                    │  (Uses TTS Engine)   │
-                    │                      │
-                    └──────────┬───────────┘
-                               │
-                               ▼
-                         ┌──────────┐
-                         │          │
-                         │ MP3 File │
-                         │          │
-                         └──────────┘
+text, report = process_pdf("papers/example.pdf", use_llm=False)
+# report contains warnings, per-stage counts, and inspectable document blocks.
 ```
 
-**main.py** = Orchestrates both steps automatically
+For an explicitly configured pipeline:
 
-## Three Ways to Use
+```python
+from pipeline import PipelineConfig, run_pipeline, serialize
 
-### Method 1: Integrated Pipeline (Fastest)
-
-Use `main.py` to run everything in one command:
-
-```bash
-python main.py papers/Titans.pdf --out Titans.mp3 --tts-engine kokoro
+config = PipelineConfig()
+config.table.mode = "verbatim"
+config.inline_math.mode = "symbolic"
+document, stats = run_pipeline("papers/example.pdf", config=config, collect_stats=True)
+text = serialize(document)
 ```
 
-**Pros:**
-- Single command
-- Automatic cleanup
-- Fastest for one-time conversion
+Stages: `extract` → `classify` → `filter_sections` → `handle_tables` → `handle_equations` → `rewrite_inline_math` → `audio_polish`. Classification and transformation stages return new documents without mutating input blocks. Layout, spans, heading levels, parent sections, and diagnostic metadata remain available in `pipeline.model` dataclasses.
 
-**Cons:**
-- Can't edit intermediate text
-- Must re-run LLM if TTS fails
+`pipeline.serialize.serialize()` is the final narration eligibility boundary. It excludes noise, layout debris, and blocks with handler failures, even when a failure occurred after section filtering. `require_narration()` turns an empty transcript into an actionable error at the application boundary. Raw rejected content stays in diagnostics.
 
-### Method 2: Manual Two-Step (Most Flexible)
+Inline LLM responses must be arrays matching detected variable identities. Surrounding prose is never returned by the model or replaced. Table LLM responses select valid data-row indices; the renderer uses only original cells. Unsupported JSON, invented prose, and bad row indices trigger a logged and per-call recorded fallback. Equation prose is model-generated and must be reviewed against its source. `pipeline.diagnostics` uses context-local storage to keep concurrent calls' warning lists separate.
 
-Run each step separately for maximum control:
+`LLMCache` provides SQLite text/vision caching. `process_pdf(cache_path=...)` keys by provider, model, and the `structured-v2` prompt identity, and closes each connection after use. `main.py --inspect` and the UI diagnostics download expose stage counts and source metadata. Web caching is not enabled by default.
 
-```bash
-# Step 1: PDF → Text (uses Gemini API)
-python pdf_to_text.py papers/Titans.pdf
+`pipeline.run_pipeline_vlm()` remains a separate opt-in library API for callers supplying a vision adapter. Neither entry point chooses it. It may paraphrase, and requires careful comparison with the paper. Scanned documents can instead be OCR-processed before the normal pipeline.
 
-# Output: Titans_audio_text.txt
-# Now you can review/edit this file!
+`text_to_speech.synthesize()` validates limits and usable text before loading a model. Chunks concatenate exactly to whitespace-normalized input; paragraph, sentence, word, and hard boundaries are used in that order. Boundary whitespace is retained to make reconstruction exact; whitespace-only chunks (possible at a limit of one character) are ignored for synthesis. Spawn workers return chunks in original order. Audio is decoded using the selected input format, exported to a temporary sibling file, validated, and atomically replaced. The CLI creates no disposable transcript, and web subprocess transcripts are removed in `finally`.
 
-# Step 2: Text → Audio (uses TTS)
-python text_to_speech.py Titans_audio_text.txt --tts-engine kokoro
-```
+`jobs.JobManager` owns bounded jobs and attempts. A condition lock guards starts and terminal transitions. Each attempt has its own bounded event log and retained result, so SSE readers cannot consume one another's completion. `GET /status/<job>/<attempt>` retrieves the result, `GET /stream/<job>/<attempt>` replays events with `Last-Event-ID`, and audio URLs identify the producing attempt. All worker exceptions become terminal errors. Retention is opportunistic on requests; in-process jobs do not survive server restarts.
 
-**Pros:**
-- Can edit LLM output before TTS
-- Reuse text file for multiple audio versions
-- Better for debugging
-- Save money (don't re-run LLM)
-
-**Cons:**
-- Two commands required
-- Must manage intermediate files
-
-### Method 3: Hybrid (Best of Both)
-
-Use main.py with `--keep-text` to save intermediate files:
-
-```bash
-# First run: generate and keep text
-python main.py papers/Titans.pdf --keep-text --out Titans_murf.mp3
-
-# This creates:
-# - Titans_murf.mp3 (audio with Murf.ai)
-# - Titans_audio_text.txt (intermediate text)
-
-# Later: reuse text with different TTS engine
-python text_to_speech.py Titans_audio_text.txt --tts-engine kokoro --out Titans_kokoro.mp3
-```
-
-**Pros:**
-- Fast first run
-- Can reuse text later
-- Compare TTS engines easily
-
-## Real-World Workflows
-
-### Workflow 1: Quick One-Off Conversion
-
-```bash
-python main.py paper.pdf --tts-engine kokoro
-# Done! → output.mp3
-```
-
-### Workflow 2: Production Quality (Review Before Audio)
-
-```bash
-# Step 1: Generate text
-python pdf_to_text.py paper.pdf
-# → paper_audio_text.txt
-
-# Step 2: Review and edit text file
-vim paper_audio_text.txt  # or any editor
-
-# Step 3: Generate audio
-python text_to_speech.py paper_audio_text.txt --tts-engine murf
-# → paper.mp3
-```
-
-### Workflow 3: Compare TTS Engines
-
-```bash
-# Step 1: Generate text once
-python pdf_to_text.py paper.pdf
-
-# Step 2: Generate with Murf.ai
-python text_to_speech.py paper_audio_text.txt --tts-engine murf --out paper_murf.mp3
-
-# Step 3: Generate with Kokoro
-python text_to_speech.py paper_audio_text.txt --tts-engine kokoro --out paper_kokoro.mp3
-
-# Now compare audio quality!
-```
-
-### Workflow 4: Batch Processing
-
-```bash
-# Process multiple papers to text first (uses Gemini API)
-for pdf in papers/*.pdf; do
-    python pdf_to_text.py "$pdf"
-done
-
-# Review all text files, make edits...
-
-# Then generate all audio (uses free Kokoro)
-for txt in *_audio_text.txt; do
-    python text_to_speech.py "$txt" --tts-engine kokoro
-done
-```
-
-## File Naming Conventions
-
-### pdf_to_text.py
-- Input: `papers/Titans.pdf`
-- Output: `Titans_audio_text.txt` (in current directory)
-- Custom: `--out my_custom_name.txt`
-
-### text_to_speech.py
-- Input: `Titans_audio_text.txt`
-- Output: `Titans.mp3` (strips `_audio_text` suffix)
-- Custom: `--out my_custom_name.mp3`
-
-### main.py
-- Input: `papers/Titans.pdf`
-- Output: `output.mp3` (default) or `--out Titans.mp3`
-- Intermediate (if `--keep-text`): `Titans_audio_text.txt`
-
-## Environment Variables
-
-Both scripts respect these `.env` variables:
-
-### For pdf_to_text.py
-```bash
-GOOGLE_API_KEY=your-key-here  # Required
-```
-
-### For text_to_speech.py
-```bash
-# For Murf.ai engine
-MURF_API_KEY=your-key-here
-MURF_VOICE_ID=marcus
-MURF_CHUNK_CHARS=2800
-
-# For Kokoro engine
-KOKORO_VOICE=af_bella
-```
-
-## Tips & Tricks
-
-### 1. Save Money on LLM Costs
-
-Generate text once, create multiple audio versions:
-
-```bash
-python pdf_to_text.py expensive_paper.pdf
-# Edit text to fix any issues
-python text_to_speech.py expensive_paper_audio_text.txt --tts-engine kokoro
-```
-
-### 2. Debug TTS Issues
-
-If audio generation fails, you still have the text:
-
-```bash
-python main.py paper.pdf --keep-text
-# If TTS fails, you have paper_audio_text.txt
-# Fix the issue, then:
-python text_to_speech.py paper_audio_text.txt
-```
-
-### 3. Custom Text Processing
-
-Skip the PDF entirely and process your own text:
-
-```bash
-echo "Your custom narration text here" > custom.txt
-python text_to_speech.py custom.txt --tts-engine kokoro
-```
-
-### 4. Incremental Updates
-
-Made a small edit to the paper? Update just one section:
-
-```bash
-# Edit the text file to add/change content
-vim paper_audio_text.txt
-
-# Regenerate audio without re-running LLM
-python text_to_speech.py paper_audio_text.txt
-```
-
-## Error Handling
-
-### If pdf_to_text.py fails:
-- Check GOOGLE_API_KEY is set
-- Verify PDF is readable
-- Check Gemini API quota
-
-### If text_to_speech.py fails:
-- For Murf.ai: Check MURF_API_KEY
-- For Kokoro: Install dependencies (`pip install torch kokoro-onnx scipy numpy`)
-- Check text file exists and is readable
-
-### If main.py fails mid-process:
-- Use `--keep-text` to save intermediate results
-- Continue from step 2 with `text_to_speech.py`
-
-## Performance Comparison
-
-| Method | LLM Calls | TTS Calls | Time | Flexibility |
-|--------|-----------|-----------|------|-------------|
-| Integrated (main.py) | 1 | 1 | Fast | Low |
-| Two-step manual | 1 | 1 | Medium | High |
-| Hybrid (--keep-text) | 1 | 1+ | Medium | Medium |
-| Batch processing | N | N | Slow | Highest |
-
-## Best Practices
-
-1. **Always keep text files** when experimenting with TTS engines
-2. **Review LLM output** before generating expensive Murf.ai audio
-3. **Use Kokoro for drafts**, Murf.ai for final production
-4. **Version control** your text files alongside audio
-5. **Batch process** PDFs to text, then review all before audio generation
-
-## Example: Complete Workflow
-
-```bash
-# 1. Convert paper to text
-python pdf_to_text.py papers/important_paper.pdf
-# Output: important_paper_audio_text.txt
-
-# 2. Review and edit (fix any LLM mistakes)
-code important_paper_audio_text.txt  # or vim, nano, etc.
-
-# 3. Generate draft with free Kokoro
-python text_to_speech.py important_paper_audio_text.txt \
-    --tts-engine kokoro \
-    --out draft.mp3
-
-# 4. Listen to draft
-# 5. If good, generate final with Murf.ai
-python text_to_speech.py important_paper_audio_text.txt \
-    --tts-engine murf \
-    --out final.mp3
-
-# 6. Keep both versions for comparison
-ls -lh draft.mp3 final.mp3 important_paper_audio_text.txt
-```
-
-## Integration with Other Tools
-
-### Shell Script Wrapper
-```bash
-#!/bin/bash
-# process_papers.sh
-for pdf in papers/*.pdf; do
-    echo "Processing $pdf..."
-    python pdf_to_text.py "$pdf"
-done
-echo "Review text files, then run:"
-echo "for txt in *_audio_text.txt; do python text_to_speech.py \"\$txt\" --tts-engine kokoro; done"
-```
-
-### Make-style Dependency
-```makefile
-%.mp3: %_audio_text.txt
-	python text_to_speech.py $< --out $@ --tts-engine kokoro
-
-%_audio_text.txt: papers/%.pdf
-	python pdf_to_text.py $<
-```
-
-This modular design gives you maximum flexibility while still offering simple one-command operation when needed!
+`pdf_to_text.py` is a standalone legacy cleanup tool. It is not called by the modern CLI or UI, and does not provide their provider adapter anymore.

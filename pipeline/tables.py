@@ -12,9 +12,9 @@ Three render modes are available (`TablePolicy.mode`):
   see the paper." Never calls the LLM.
 - `verbatim` — reads cells sequentially with column headers prepended. Never
   calls the LLM.
-- `prose` — sends the CSV plus caption to an LLM for a bounded, vocab-checked
-  summary. Falls back to `skip` if the LLM call fails or the output contains
-  invented numbers.
+- `prose` — requests structured row indices from an LLM and renders original
+  cells with their column associations. Falls back to `verbatim` with a warning
+  if the response is missing, unstructured, or invalid.
 
 Detection is intentionally conservative: pdfplumber runs with the default
 (ruled-line) strategy and detections smaller than 2×2 cells are discarded.
@@ -26,6 +26,8 @@ from __future__ import annotations
 import csv
 import io
 import re
+import json
+from pipeline.diagnostics import fallback
 from dataclasses import dataclass, field, replace
 from typing import Callable, Literal
 
@@ -93,7 +95,7 @@ class TablePolicy:
     min_cols: int = 2
     # Verbatim mode reads up to this many rows, then emits a continuation line.
     verbatim_max_rows: int = 20
-    # Prose prompts tell the LLM to read at most this many illustrative rows.
+    # Structured selection accepts at most this many illustrative data rows.
     prose_illustrative_rows: int = 3
 
 
@@ -307,58 +309,47 @@ def _render_verbatim(table: TableData, max_rows: int) -> str:
     return " ".join(lines)
 
 
-_PROSE_PROMPT_TEMPLATE = """\
-You are converting a table into spoken narration for an audiobook.
-{caption_line}
-Produce a {min_s}-to-{max_s} sentence spoken summary. Name each column and
-read at most {illus} illustrative rows. Do not invent data. Do not include
-LaTeX, Markdown, or CSV in the output.
-
+_PROSE_PROMPT_TEMPLATE = """Select representative data rows for narration from this CSV.
+Return only a JSON object with key "rows": a nonempty array of unique zero-based
+DATA row indices (excluding the header if present), at most {limit} indices.
+Do not return prose or values. Header present: {header}.
 CSV:
 {csv}
 """
 
 
-def _render_prose(
-    table: TableData,
-    policy: TablePolicy,
-    llm: LLMCallable | None,
-) -> str:
-    if llm is None:
-        return _render_skip(table)
-    max_s = min(6, max(2, table.n_rows // 2))
-    caption_line = (
-        f'The table title is "{table.caption}".'
-        if table.caption
-        else "The table has no caption in the paper."
-    )
-    prompt = _PROSE_PROMPT_TEMPLATE.format(
-        caption_line=caption_line,
-        min_s=2,
-        max_s=max_s,
-        illus=policy.prose_illustrative_rows,
-        csv=table.to_csv(),
-    )
+def _render_prose(table: TableData, policy: TablePolicy, llm: LLMCallable | None) -> str:
+    data_rows = table.rows[1:] if table.header else table.rows
     try:
-        out = llm(prompt).strip()
-    except Exception:
-        return _render_skip(table)
-    if not out or not _prose_is_safe(out, table):
-        return _render_skip(table)
-    return out
+        if llm is None:
+            raise ValueError("provider unavailable")
+        result = json.loads(llm(_PROSE_PROMPT_TEMPLATE.format(
+            limit=policy.prose_illustrative_rows, header=bool(table.header), csv=table.to_csv())))
+        if not isinstance(result, dict) or set(result) != {"rows"}:
+            raise ValueError("expected structured row selection")
+        indices = result["rows"]
+        if (not isinstance(indices, list) or not indices
+                or len(indices) > policy.prose_illustrative_rows
+                or any(type(i) is not int or not 0 <= i < len(data_rows) for i in indices)
+                or len(set(indices)) != len(indices)):
+            raise ValueError("invalid row indices")
+        indices = sorted(indices)
+        rows = ([table.header] if table.header else []) + [data_rows[i] for i in indices]
+        selected = replace(table, rows=rows)
+        narration = _render_verbatim(selected, len(indices))
+        omitted = len(data_rows) - len(indices)
+        if omitted:
+            narration += f" {omitted} other rows are in the paper."
+        return narration
+    except Exception as exc:
+        fallback(f"Table {table.index} selection rejected; reading source cells: {exc}")
+        return _render_verbatim(table, policy.verbatim_max_rows)
 
 
-_FLOAT_RE = re.compile(r"-?\d+\.\d+")
+_NUMBER_TOKEN_RE = re.compile(r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?")
 
 
 def _prose_is_safe(prose: str, table: TableData) -> bool:
-    """Reject outputs that introduce numeric values absent from the CSV.
-
-    Only decimal tokens are checked: small integers commonly appear as
-    lexical counts ('three illustrative rows') that aren't data fabrication.
-    """
-    csv_text = table.to_csv()
-    for tok in _FLOAT_RE.findall(prose):
-        if tok not in csv_text:
-            return False
-    return True
+    """Legacy numeric screen only; structured rendering enforces associations."""
+    allowed = set(_NUMBER_TOKEN_RE.findall(table.to_csv()))
+    return all(t in allowed for t in _NUMBER_TOKEN_RE.findall(prose))

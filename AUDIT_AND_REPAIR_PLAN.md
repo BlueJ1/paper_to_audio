@@ -1,6 +1,34 @@
 # Project audit and repair plan
 
-Audited 2026-09-06 against the existing working tree, including uncommitted and untracked development. This audit changes documentation only; the defects below remain open.
+Audited 2026-09-06 against the existing working tree, including uncommitted and untracked development. The findings below describe the original audit baseline; see the repair status immediately below for the implemented changes.
+
+## Repair status — 2026-09-07
+
+All five implementation milestones are implemented in the working tree. The original findings and reproductions below are retained as historical evidence, not a list of still-open defects.
+
+| Milestone | Implementation and verification |
+| --- | --- |
+| 1 — F1/F3/F5 | Contextual lettered appendices; explicit prefix variants; unknown-level boundary test; grouped quantities, terminal numbers, Unicode/script/operator fixes; final serialization excludes rejected content; empty narration is an error. Generated-PDF regressions require no external fixtures. |
+| 2 — F2/F4 | Shared `processing.py` policy/configuration and lazy `providers.py`; enabled policies make spy-provider calls; inline JSON replacements preserve variable identity and immutable surrounding prose; table JSON selects source rows, retaining original cells/associations. Visible deterministic fallbacks, CLI cache/stats/inspection, and web diagnostics. Vision remains library-only. |
+| 3 — F6/TTS F9 | Guaranteed chunk limits and exact normalized reconstruction; positive option validation before initialization; explicit MP3/WAV/FLAC/OGG decoding; validated atomic MP3 publication; ordered spawn workers; temporary cleanup. Actual local CLI and two-worker Kokoro conversions succeeded. |
+| 4 — F7/F8 | Bounded in-process jobs/attempts, locked starts/terminal states, overlap rejection, PDF/JSON/options validation, replayable SSE and status endpoints, attempt-specific outputs, expiry/deletion, whole-worker error handling, subprocess timeouts. Browser busy/error/reconnect/regenerate paths repaired and exercised. |
+| 5 — F9/maintenance | Optional pinned dependency sets, transitive constraints snapshot, Python 3.12 declaration, mode-aware setup checks, CI, current usage docs, pure classification, and mixed metadata encoding. Fresh core and Kokoro environments pass `pip check`; the missing English pronunciation model found during clean smoke testing is now explicitly pinned and checked. |
+
+### Verification evidence
+
+- **413 tests passed**, no skips, six deprecation warnings in the working environment. New suites exercise generated PDFs, adversarial LLM outputs, CLI validation, audio boundaries/formats/failure publication, web routes, concurrency, replay, failure handling, and retention. Legacy expectations were updated only where the intentionally changed contract required it (pure classification, structured model output, source-cell fallback, narrated operators, contextual appendix detection).
+- A clean Python 3.12 environment installed `requirements-dev.txt` with constraints and passed mode-aware setup and `pip check`. The core-only environment passed all 408 tests then present; after installing the selected Kokoro dependencies, the final **413-test suite passed** with no skips and six deprecation warnings. Essential coverage does not require sample papers or optional provider/ML imports.
+- A fresh selected-Kokoro install, including `en_core_web_sm` 3.8.0, passes `pip check` and produces an actual MP3 with cached speech resources. No changes were made to the original working environment. Its unsupported PyTorch wheel tag explains the old `pip check` warning; the fresh installation does not report it.
+- Short generated PDF → CLI → Kokoro MP3: **5,475 ms**, **89,132 bytes**. Two-worker/two-chunk CLI: **5,225 ms**, **84,908 bytes**. Both decoded successfully. The updated shared worker loader was also checked in a subsequent two-worker run. Runs used `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`; cached weights were available.
+- Real Chrome verification: readable PDF upload → deterministic transcript → edit → local audio → playable media (`readyState=4`) → attachment response (HTTP 200, 45,740 bytes) → regeneration. Conflicting controls were disabled during generation; reloading an active attempt restored edited text and completed audio with a different URL. A simulated fetch failure and a non-JSON HTML 413 response restored controls. Reprocessing the same selected PDF reused its job instead of consuming another upload slot. Closing the progress stream still recovered completion through status polling. No JavaScript runtime errors were reported. The browser tool's direct download-saving command stalled; the real attachment response and browser media decoding were verified separately.
+- Three-paper library corpus outputs were compared with the original commit: Shaw **17,717 → 17,765** characters, Titans **75,395 → 75,810**, ViT **34,659 → 34,695**. Changed excerpts reflect terminal number expansion, spoken ASCII operators, and mathematical glyph/script normalization. Existing corpus baselines remain unchanged and pass. These counts do not establish full narration fidelity.
+- Provider adapters constructed successfully without inference calls. Official documentation confirms the old Cerebras Qwen default is deprecated; the replacement `gpt-oss-120b` is in the [current catalog](https://inference-docs.cerebras.ai/models/overview). Murf format casing and voice naming were checked against its [synthesis reference](https://murf.ai/api/docs/api-reference/text-to-speech/generate) and [voice library](https://murf.ai/api/docs/voices-styles/voice-library). No paid provider requests were made.
+
+### Deliberate limits and follow-up work
+
+Author metadata and inline citations remain preserved; the optional preference question did not change those defaults. Deterministic tables read up to 20 rows; LLM mode selects at most three rows and announces omissions. Equation explanations remain generated and require transcript review; severe source-layout damage and residual symbolic artifacts are not fixed by superficial validation. Broader unruled-table recall, figure-internal labels, and possible duplicate table captions remain extraction work, with positive/negative layout fixtures required before heuristic changes.
+
+Vision is still an opt-in library API. Scanned/no-text PDFs fail with guidance to OCR or explicitly use that API; no cloud fallback is silently enabled. In-process web state survives browser reconnects, not application restarts. Retention cleanup runs on incoming requests. Constraints capture a validated macOS dependency snapshot, not a cross-platform hash lock. CI is configured but has not been executed remotely. Live cloud authentication/quota/voice availability, cold speech-weight downloads, and full-paper listening quality remain unverified.
 
 ## Confirmed product intent
 

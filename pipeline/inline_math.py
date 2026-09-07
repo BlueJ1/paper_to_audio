@@ -16,9 +16,9 @@ the block text. Then it rewrites according to `InlineMathPolicy.mode`:
   span. Deterministic and cheap; handles Greek letters well (`α` → `alpha`)
   but effectively a no-op on plain italic ASCII (`x` → `x`). Still useful
   for the meta annotation that downstream consumers can inspect.
-- `llm`: send the delimited paragraph to an LLM under a prompt that asks
-  to rewrite only the delimited spans. Falls back to `symbolic` on failure
-  or if the output is suspiciously short.
+- `llm`: send only detected variable regions and validate a JSON array of
+  replacements against their spoken identities. Splice these into immutable
+  prose; fall back to `symbolic` with a warning on failure.
 
 The pure function contract matches the rest of the pipeline: body blocks
 without any detected variables pass through untouched; rewritten blocks
@@ -28,11 +28,13 @@ A/B the rendering without re-running detection.
 from __future__ import annotations
 
 import re
+import json
+from pipeline.diagnostics import fallback
 import unicodedata
 from dataclasses import dataclass, replace
 from typing import Callable, Literal
 
-from pipeline.equations import _sanitize_narration, _symbolic_rewrite
+from pipeline.equations import _symbolic_rewrite
 from pipeline.model import Block, Document, Span
 
 
@@ -79,8 +81,7 @@ class InlineMathPolicy:
     mode: InlineMathMode = "skip"
     min_runs_for_llm: int = 1
     max_chars: int = 6000
-    # Output-length floor relative to input — below this the LLM is assumed
-    # to have truncated, and we fall back to symbolic rendering.
+    # Retained for caller compatibility; structured validation supersedes it.
     min_output_ratio: float = 0.5
 
 
@@ -230,46 +231,28 @@ def _render_symbolic(marked: str) -> str:
     return _DELIM_RE.sub(_sub, marked)
 
 
-_LLM_PROMPT = """\
-The paragraph below contains math variables delimited by {open} and {close}.
-Rewrite only the delimited spans as spoken English suitable for an
-audiobook: spell Greek letters by name (alpha, beta, ...), read variable
-letters directly ("x"), and absorb any adjacent subscripts/superscripts
-into natural spoken phrasing. Keep all surrounding prose exactly as
-written, word for word. Remove the delimiters from your output. Output
-only the full paragraph — no preamble, no explanation.
-
-Paragraph:
-{text}"""
+_LLM_PROMPT = """Return only a JSON array of spoken replacements, one per math span in
+order. Spell Greek letters by name and preserve variable identity. No commentary.
+Math spans: {runs}"""
 
 
-def _render_llm(
-    marked: str, policy: InlineMathPolicy, llm: LLMCallable | None
-) -> str | None:
-    """Send the delimited paragraph to `llm`. Returns None on any failure."""
-    if llm is None:
-        return None
-    if len(marked) > policy.max_chars:
-        return None
+def _render_llm(marked: str, policy: InlineMathPolicy, llm: LLMCallable | None) -> str | None:
     runs = _DELIM_RE.findall(marked)
-    if len(runs) < policy.min_runs_for_llm:
+    if llm is None or len(marked) > policy.max_chars or len(runs) < policy.min_runs_for_llm:
+        fallback("Inline math used deterministic narration (provider unavailable or size guard).")
         return None
-    prompt = _LLM_PROMPT.format(
-        open=_MATH_DELIM_OPEN,
-        close=_MATH_DELIM_CLOSE,
-        text=marked,
-    )
     try:
-        out = llm(prompt).strip()
-    except Exception:
+        replacements = json.loads(llm(_LLM_PROMPT.format(runs=json.dumps(runs))))
+        if not isinstance(replacements, list) or len(replacements) != len(runs):
+            raise ValueError("expected one replacement per span")
+        # Detected regions currently contain single variables, so their spoken
+        # identity is deterministic. A future region detector needs its own validator.
+        for raw, spoken in zip(runs, replacements):
+            expected = _render_symbolic(_MATH_DELIM_OPEN + raw + _MATH_DELIM_CLOSE)
+            if not isinstance(spoken, str) or spoken.strip() != expected.strip():
+                raise ValueError("replacement changes variable identity")
+        replacements = iter(replacements)
+        return _DELIM_RE.sub(lambda _: next(replacements), marked)
+    except Exception as exc:
+        fallback(f"Inline math response rejected; using symbolic narration: {exc}")
         return None
-    out = _sanitize_narration(out)
-    if not out:
-        return None
-    # Some LLMs leave the delimiters in place — strip them defensively.
-    out = out.replace(_MATH_DELIM_OPEN, "").replace(_MATH_DELIM_CLOSE, "")
-    # Sanity check: suspiciously short output usually means truncation.
-    baseline = max(40, int(policy.min_output_ratio * len(marked)))
-    if len(out) < baseline:
-        return None
-    return out

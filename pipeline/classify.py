@@ -11,6 +11,7 @@ pure heuristics so classification is cheap and reproducible.
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from collections import defaultdict
 
 from pipeline.model import BBox, Block, Document
@@ -86,7 +87,8 @@ _HEADER_FOOTER_MIN_PAGES = 3
 # ---------------------------------------------------------------------------
 
 def classify_blocks(doc: Document) -> Document:
-    """Assign `kind`, heading `level`, and `parent_section` in place."""
+    """Assign classification on new blocks, preserving the input snapshot."""
+    doc = replace(doc, blocks=[replace(b, meta=dict(b.meta)) for b in doc.blocks])
     _mark_headers_and_footers(doc)
     body_size = doc.fonts.body_size
     for b in doc.blocks:

@@ -4,6 +4,8 @@ Converts academic papers (PDF) into audio-friendly text using targeted replaceme
 Preserves original text verbatim; only replaces elements that are bad for TTS
 (math formulas, citations, LaTeX artifacts, special characters).
 """
+from __future__ import annotations
+
 import argparse
 import os
 import re
@@ -13,10 +15,6 @@ from typing import Dict, List, Optional, Tuple
 
 import fitz  # pymupdf
 from dotenv import load_dotenv
-from langchain_core.language_models import BaseChatModel
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_openai import ChatOpenAI
 
 
 def load_pdf_text(pdf_path: str) -> str:
@@ -41,38 +39,13 @@ GEMINI_MODELS = [
 DEFAULT_LLM_MODEL = GEMMA_MODELS[0]
 
 CEREBRAS_MODELS = [
-    "qwen-3-235b-a22b-instruct-2507",  # large MoE, fast on Cerebras hardware (recommended)
+    "gpt-oss-120b",  # large MoE, fast on Cerebras hardware (recommended)
 ]
 DEFAULT_CEREBRAS_MODEL = CEREBRAS_MODELS[0]
 _CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 
 
-def build_llm(
-    model: str = DEFAULT_LLM_MODEL,
-    provider: str = "google",
-) -> BaseChatModel:
-    """Build an LLM instance for math rewriting.
-
-    Args:
-        model: Model name. Defaults to the Google default; pass a Cerebras model
-               name when provider='cerebras'.
-        provider: 'google' (Gemma/Gemini via Google AI) or 'cerebras'.
-    """
-    if provider == "cerebras":
-        api_key = os.getenv("CEREBRAS_API_KEY", "").strip()
-        if not api_key:
-            raise RuntimeError("Missing CEREBRAS_API_KEY in environment.")
-        return ChatOpenAI(
-            model=model,
-            base_url=_CEREBRAS_BASE_URL,
-            api_key=api_key,
-            temperature=0.1,
-        )
-    # Default: Google Gemma/Gemini
-    return ChatGoogleGenerativeAI(
-        model=model,
-        temperature=0.1,
-    )
+from providers import build_llm
 
 
 # ---------------------------------------------------------------------------
@@ -543,6 +516,7 @@ def _llm_rewrite_math(
     )
 
     # Use a single human message (Gemma 3 does not support system messages)
+    from langchain_core.prompts import ChatPromptTemplate
     prompt = ChatPromptTemplate.from_messages(
         [
             ("human", instructions + "\n\nParagraph:\n\n{passage}"),

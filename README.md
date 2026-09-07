@@ -1,150 +1,68 @@
 # Paper to Audio
 
-Convert academic papers (PDF) into an audio file using LangChain + Google Gemini and TTS (Murf.ai or Kokoro).
+A personal local tool for reading academic PDFs aloud. The layout-aware pipeline preserves prose, narrates detected math and tables, and omits references, appendices, running headers, and footnotes. Review the transcript before generating audio in the web UI.
 
-## Architecture
+## Install
 
-This project consists of three modular scripts that can be run independently or together:
-
-1. **`pdf_to_text.py`** - Converts PDF to audio-friendly text using LLM
-2. **`text_to_speech.py`** - Converts text to speech using TTS engines  
-3. **`main.py`** - Integrated pipeline that runs both steps
-
-## TTS Engine Options
-
-This tool supports two TTS engines:
-
-1. **Murf.ai** (default) - Cloud-based, high-quality, paid API
-2. **Kokoro** - Local, free, open-source model ([hexgrad/Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M))
-
-## Prerequisites
-
-Install ffmpeg (required for audio processing):
+Use **Python 3.12**. Install FFmpeg (`brew install ffmpeg` on macOS or `sudo apt-get install ffmpeg` on Ubuntu).
 
 ```bash
-# macOS
-brew install ffmpeg
-
-# Ubuntu/Debian
-sudo apt-get install ffmpeg
-
-# Windows (via chocolatey)
-choco install ffmpeg
-```
-
-## Setup
-
-1. Create a virtual environment and install dependencies:
-
-```bash
-python -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements-kokoro.txt -c constraints.txt
+python check_setup.py --tts-engine kokoro
 ```
 
-2. Set environment variables (create a `.env` file or export in shell):
+This installs the core app, local Kokoro engine, and English pronunciation model. Kokoro downloads its speech weights/voice on first use; later runs can use cached resources offline. For deterministic PDF text processing or Murf alone, install `requirements.txt` instead. See [SETUP.md](SETUP.md) for optional providers, clean-install checks, and dependency updates.
+
+## Web workflow
 
 ```bash
-# Copy the example file
-cp .env.example .env
-
-# Edit .env and add your API keys:
-# GOOGLE_API_KEY - Get from https://aistudio.google.com/app/apikey
-# MURF_API_KEY - Get from https://murf.ai/api (only needed if using Murf.ai)
+python app.py
 ```
 
-## Usage
+Open [the local app](http://127.0.0.1:5000). Upload a readable PDF, choose whether to enable LLM narration, and click **Process PDF**. Edit the transcript, choose Kokoro or Murf, then **Generate Audio**. Play or download the resulting MP3. **Regenerate** uses the current edited text and creates a new audio URL.
 
-### Option 1: Integrated Pipeline (Recommended)
+The UI defaults to deterministic text processing and Kokoro. LLM narration is optional and requires the selected provider's installation and key. Diagnostics are downloadable after text processing and include warnings, stage counts, source table/equation data, and marked inline math. All conflicting controls are disabled during work. Reloading during a running attempt reconnects to it; progress events are replayable and the terminal result is also available through status lookup.
 
-Process everything in one command:
+Jobs live in this Python process. Restarting the app loses active job state. Files expire after 24 hours of inactivity, cleaned on subsequent requests. Local limits are two concurrent operations, 32 jobs, eight retained attempts per job, 50 MB uploads, and 2 million transcript characters. Audio subprocesses time out after 30 minutes. The job deletion API is `DELETE /jobs/<job_id>` and rejects active jobs.
+
+## CLI
 
 ```bash
-# Using Murf.ai (cloud, paid)
-python main.py papers/Titans.pdf --out output.mp3
+# Fully local; no LLM API key
+python main.py papers/example.pdf --no-llm --tts-engine kokoro --out output.mp3 --keep-text
 
-# Using Kokoro (local, free)
-python main.py papers/Titans.pdf --out output.mp3 --tts-engine kokoro
+# Optional Google LLM for math and table selection (install requirements-google.txt)
+python main.py papers/example.pdf --tts-engine kokoro --out output.mp3 --inspect narration.json --cache narration.sqlite
 
-# Keep intermediate text file
-python main.py papers/Titans.pdf --keep-text
+# Optional Cerebras provider (install requirements-cerebras.txt)
+python main.py papers/example.pdf --llm-provider cerebras --tts-engine kokoro --out output.mp3
 
-# Use existing text file (skip PDF processing)
-python main.py papers/Titans.pdf --text-file Titans_audio_text.txt
+# Speak an edited transcript directly
+python text_to_speech.py edited.txt --tts-engine kokoro --out output.mp3
+
+# Local parallel generation; each worker loads its own model
+python text_to_speech.py edited.txt --tts-engine kokoro --kokoro-workers 2 --out output.mp3
 ```
 
-### Option 2: Two-Step Process
+CLI defaults remain **Google LLM enabled** and **Murf TTS**. Use `--no-llm --tts-engine kokoro` for a local run. Google defaults to `gemma-3-27b-it`; Cerebras defaults to `gpt-oss-120b`. Override using `--llm-model`. `--max-chars` and `--kokoro-workers` must be positive. `--keep-text` saves `<pdf_basename>_audio_text.txt` in the current directory. `--text-file edited.txt` bypasses PDF processing in `main.py` (the positional PDF argument is still required but unused).
 
-Run each step independently for more control:
+## Narration behavior
 
-**Step 1: Convert PDF to audio-friendly text**
+- Deterministic mode uses symbolic math and reads up to 20 table rows with their source column labels. Additional rows are explicitly noted.
+- LLM mode requests equation narration, validated single-variable replacements, and up to three representative table row indices. Table narration is rendered from original cells, preserving row/column associations. Invalid responses produce a visible warning and faithful deterministic fallback.
+- Surrounding body prose is immutable during inline-math replacement. Generated equation explanations still need review; validation cannot prove their meaning. Numeric and pronunciation polishing applies afterward in both modes.
+- Author metadata and inline citations remain included pending a different narration preference. Unruled tables and labels embedded in figures remain extraction limitations.
+- Blank/scanned PDFs with no usable text fail with an actionable message. OCR or the explicit vision library API is needed. Vision is never selected automatically and is not exposed in the UI/CLI.
+- Rejected blocks remain in diagnostics and are excluded from speech. Empty or failed audio runs never replace a valid output. Murf MP3, WAV, FLAC, and OGG input chunks are decoded explicitly; final output is always MP3.
+
+## Development
+
 ```bash
-python pdf_to_text.py papers/Titans.pdf
-# Output: Titans_audio_text.txt
+python -m pip install -r requirements-dev.txt -c constraints.txt
+python -m pytest -q
+python check_setup.py --dev
 ```
 
-**Step 2: Convert text to speech**
-```bash
-# Using Murf.ai
-python text_to_speech.py Titans_audio_text.txt --out Titans.mp3
-
-# Using Kokoro  
-python text_to_speech.py Titans_audio_text.txt --out Titans.mp3 --tts-engine kokoro
-```
-
-### Why Use the Two-Step Process?
-
-- **Edit the text**: Review and modify the LLM output before generating audio
-- **Try different TTS engines**: Generate audio with both Murf.ai and Kokoro from the same text
-- **Save costs**: Reuse the LLM-processed text without re-running Gemini
-- **Debug**: Isolate issues in PDF processing vs. speech generation
-
-## Command-Line Options
-
-### main.py (Integrated Pipeline)
-- `pdf` - Path to PDF file
-- `--out OUTPUT.mp3` - Output audio filename (default: output.mp3)
-- `--tts-engine {murf,kokoro}` - TTS engine (default: murf)
-- `--max-chars N` - Maximum characters per TTS chunk (default: 2800)
-- `--keep-text` - Keep intermediate text file
-- `--text-file FILE` - Use existing text file (skips PDF processing)
-
-### pdf_to_text.py (PDF to Text)
-- `pdf` - Path to PDF file
-- `--out FILE.txt` - Output text filename (default: `<pdf_name>_audio_text.txt`)
-
-### text_to_speech.py (Text to Speech)
-- `text_file` - Path to text file
-- `--out OUTPUT.mp3` - Output audio filename (default: `<text_name>.mp3`)
-- `--tts-engine {murf,kokoro}` - TTS engine (default: murf)
-- `--max-chars N` - Maximum characters per TTS chunk (default: 2800)
-
-## Environment Variables
-
-- `GOOGLE_API_KEY` - Required for all engines
-- `MURF_API_KEY` - Required only for Murf.ai engine
-- `MURF_VOICE_ID` - Murf.ai voice (default: marcus)
-- `MURF_CHUNK_CHARS` - Characters per chunk (default: 2800)
-- `KOKORO_VOICE` - Kokoro voice (default: af_bella)
-  - Available voices: af, af_bella, af_sarah, am_adam, am_michael, bf_emma, bf_isabella, bm_george, bm_lewis
-
-## Notes
-
-- The LLM rewrites the PDF into audio-friendly prose, describes figures where they appear, and integrates footnotes into the flow.
-- Bibliography and inline references are omitted for a smoother listening experience.
-- If Murf returns a size limit error, lower `MURF_CHUNK_CHARS` or pass `--max-chars`.
-- Using `gemini-2.5-flash-lite` model which supports API key authentication (some newer models require OAuth2).
-- Kokoro models are downloaded automatically to HuggingFace cache (`~/.cache/huggingface/`) on first use.
-
-## Troubleshooting
-
-If you get `401 UNAUTHENTICATED` errors:
-- Make sure your `GOOGLE_API_KEY` is valid and set in `.env`
-- The current implementation uses `gemini-2.5-flash-lite` which supports API keys
-- Some newer Gemini models require OAuth2 instead of API keys
-
-If Kokoro dependencies fail to install:
-- Make sure you have Python 3.8+ installed
-- Try installing PyTorch separately first: `pip install torch`
-- On Apple Silicon Macs, you may need to install the ARM64 version of torch
-
+Core tests include generated PDFs, adversarial LLM responses, CLI validation, audio format/atomic output checks, and web lifecycle/replay failures. These run without cloud providers, Kokoro, or optional paper fixtures. The supplied three-paper corpus provides additional coverage; its existing numeric baselines were preserved during repair. See [MODULAR_GUIDE.md](MODULAR_GUIDE.md), [AGENTS.md](AGENTS.md), and [AUDIT_AND_REPAIR_PLAN.md](AUDIT_AND_REPAIR_PLAN.md).

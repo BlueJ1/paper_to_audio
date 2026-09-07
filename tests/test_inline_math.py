@@ -247,9 +247,9 @@ class TestRenderLLM:
         out_doc = rewrite_inline_math(
             doc,
             InlineMathPolicy(mode="llm", min_runs_for_llm=1, min_output_ratio=0.0),
-            llm=lambda _: "Given x we compute y; they are related by a simple rule.",
+            llm=lambda _: '["x", "y"]',
         )
-        assert "simple rule" in out_doc.blocks[0].text
+        assert out_doc.blocks[0].text == "Given x we compute y."
         # No delimiters leak through.
         assert _MATH_DELIM_OPEN not in out_doc.blocks[0].text
 

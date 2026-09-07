@@ -24,6 +24,8 @@ can't forget them.
 from __future__ import annotations
 
 import re
+import unicodedata
+from pipeline.diagnostics import fallback
 from dataclasses import dataclass, field, replace
 from typing import Callable, Literal
 
@@ -311,24 +313,21 @@ def _reconstruct_with_scripts(b: Block, number: str | None) -> str:
 
 def _symbolic_rewrite(text: str) -> str:
     """Replace Greek letters, math operators, and script markers with English."""
+    # Preserve script runs before NFKC flattens their vertical placement.
+    for mapping, marker in ((_SUPERSCRIPT_MAP, "^"), (_SUBSCRIPT_MAP, "_")):
+        text = re.sub("[" + re.escape("".join(mapping)) + "]+",
+                      lambda m: marker + "{" + "".join(mapping[c] for c in m[0]) + "}", text)
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"_\{([^}]+)\}", r" sub \1 ", text)
+    text = re.sub(r"\^\{([^}]+)\}", r" to the \1 ", text)
+    text = re.sub(r"_([^\W_]+)", r" sub \1 ", text)
+    text = re.sub(r"\^([^\W_]+)", r" to the \1 ", text)
     for sym, name in _GREEK_MAP.items():
         text = text.replace(sym, f" {name} ")
     for sym, repl in _UNICODE_MATH_MAP.items():
         text = text.replace(sym, repl)
-    for sym, repl in _SUPERSCRIPT_MAP.items():
-        text = text.replace(sym, f"^{repl}")
-    for sym, repl in _SUBSCRIPT_MAP.items():
-        text = text.replace(sym, f"_{repl}")
-    # Script markers emitted by _reconstruct_with_scripts or by the maps above.
-    # The `_{token}` / `^{token}` forms come from legacy LaTeX that may still
-    # leak through; match both.
-    text = re.sub(r"_\{([^}]+)\}", r" sub \1 ", text)
-    text = re.sub(r"\^\{([^}]+)\}", r" to the \1 ", text)
-    text = re.sub(r"_([A-Za-z0-9+\-]+)", r" sub \1 ", text)
-    text = re.sub(r"\^([A-Za-z0-9+\-]+)", r" to the \1 ", text)
-    # Common ASCII operators.
-    text = text.replace("≠", " not equal to ")
-    text = text.replace("=", " equals ")
+    for sym, word in (("=", "equals"), ("+", "plus"), ("-", "minus"), ("/", "over")):
+        text = text.replace(sym, f" {word} ")
     # Whitespace polish.
     text = re.sub(r"\s+", " ", text).strip()
     return text
@@ -386,6 +385,8 @@ def render_equation(
     # No narration produced. Emit the symbolic form with the eq-number prefix
     # if we have one — even without an LLM the listener gets something that
     # at least names the equation's components.
+    if policy.mode != "skip":
+        fallback("Equation narration rejected or unavailable; using symbolic source.")
     return _render_skip(data)
 
 
@@ -461,7 +462,7 @@ def _prepend_equation_number(narration: str, number: str | None) -> str:
     if not number:
         return narration
     spoken = _spoken_number(number)
-    if spoken.lower() in narration.lower():
+    if re.match(r"^\s*Equation\s+" + re.escape(spoken) + r"(?!\w|\s+point\b)", narration, re.I):
         return narration
     # Capitalize the narration and prepend.
     narration = narration.lstrip()

@@ -313,7 +313,7 @@
     <div class="option-group">
       <label>
         <input type="checkbox" class="toggle" id="use-llm-toggle" />
-        Use LLM cleanup
+        Use LLM math narration
         <span style="font-size:.8rem;color:var(--muted);font-weight:400">(needs API key)</span>
       </label>
     </div>
@@ -326,7 +326,7 @@
           <option value="google:gemma-4-31b-it">gemma-4-31b-it (Google, slow, thinking)</option>
           <option value="google:gemma-4-26b-a4b-it">gemma-4-26b-a4b-it (Google, slow, thinking)</option>
           <option value="google:gemini-3.1-flash-lite-preview">gemini-3.1-flash-lite-preview (Google, fast)</option>
-          <option value="cerebras:qwen-3-235b-a22b-instruct-2507">qwen-3-235b-a22b-instruct-2507 (Cerebras, fast)</option>
+          <option value="cerebras:gpt-oss-120b">gpt-oss-120b (Cerebras, fast)</option>
         </select>
       </label>
     </div>
@@ -402,6 +402,39 @@
   // --- State ---
   let jobId = null;
   let selectedFile = null;
+  let busy = false;
+  function setBusy(value) {
+    busy = value;
+    for (const id of ['process-btn', 'generate-btn', 'regenerate-btn', 'change-file-btn',
+                      'file-input', 'use-llm-toggle', 'tts-engine-select']) $(id).disabled = value;
+    $('process-btn').disabled = value || !selectedFile;
+    $('generate-btn').disabled = value || !jobId;
+    $('regenerate-btn').disabled = value || !jobId;
+    $('llm-model-select').disabled = value || !$('use-llm-toggle').checked;
+    $('text-area').readOnly = value;
+  }
+  async function requestJSON(url, options) {
+    const response = await fetch(url, {...options, signal: AbortSignal.timeout(30000)});
+    const body = await response.text();
+    let data;
+    try { data = JSON.parse(body); } catch { throw new Error(`Request failed (${response.status})`); }
+    if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+    return data;
+  }
+  function postJSON(url, data) {
+    return requestJSON(url, {method: 'POST', headers: {'Content-Type': 'application/json'},
+                             body: JSON.stringify(data)});
+  }
+  function operationError(target, error) {
+    appendLog(target, error.message || String(error), 'error');
+    setStatus(target, 'error');
+  }
+  function remember(value) {
+    try { sessionStorage.setItem('paperAudioAttempt', JSON.stringify(value)); } catch {}
+  }
+  function forget() {
+    try { sessionStorage.removeItem('paperAudioAttempt'); } catch {}
+  }
 
   // --- LLM toggle gates model selector ---
   $('use-llm-toggle').addEventListener('change', () => {
@@ -433,11 +466,13 @@
   });
 
   function handleFile(file) {
+    if (busy) return;
     if (!file.name.toLowerCase().endsWith('.pdf')) {
       alert('Please select a PDF file.');
       return;
     }
     selectedFile = file;
+    jobId = null;
     $('file-name-label').textContent = file.name;
     $('file-chosen').style.display = 'flex';
     dropZone.style.display = 'none';
@@ -450,121 +485,123 @@
     $('char-count').textContent = $('text-area').value.length.toLocaleString() + ' characters';
   }
 
-  // --- Process PDF ---
+  // All operations share one busy state and restore controls in finally.
   $('process-btn').addEventListener('click', async () => {
-    if (!selectedFile) return;
-
-    $('process-btn').disabled = true;
+    if (busy || !selectedFile) return;
+    setBusy(true);
     $('card-text-log').classList.remove('hidden');
-    $('card-text').classList.add('hidden');
-    $('card-audio-log').classList.add('hidden');
-    $('card-audio').classList.add('hidden');
+    for (const id of ['card-text', 'card-audio-log', 'card-audio']) $(id).classList.add('hidden');
     $('text-log').textContent = '';
     setStatus('text', 'running');
-
-    // Upload PDF
-    const form = new FormData();
-    form.append('pdf', selectedFile);
-    let res;
     try {
-      res = await fetch('/upload', { method: 'POST', body: form });
-    } catch (e) {
-      appendLog('text', `Upload error: ${e}`, 'error');
-      return;
-    }
-    if (!res.ok) {
-      const err = await res.json();
-      appendLog('text', `Upload error: ${err.error}`, 'error');
-      setStatus('text', 'error');
-      return;
-    }
-    const { job_id } = await res.json();
-    jobId = job_id;
-
-    // Start processing
-    const useLlm = $('use-llm-toggle').checked;
-    const llmModel = $('llm-model-select').value;
-    await fetch(`/process-text/${jobId}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ use_llm: useLlm, llm_model: llmModel }),
-    });
-
-    // Stream progress
-    streamJob(`/stream/${jobId}`, 'text', msg => {
-      if (msg.type === 'done') {
-        $('text-area').value = msg.text;
-        updateCharCount();
-        $('card-text').classList.remove('hidden');
-        $('card-text').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      if (!jobId) {
+        const form = new FormData();
+        form.append('pdf', selectedFile);
+        const upload = await requestJSON('/upload', {method: 'POST', body: form});
+        jobId = upload.job_id;
       }
-    });
+      const attempt = await postJSON(`/process-text/${jobId}`, {
+        use_llm: $('use-llm-toggle').checked, llm_model: $('llm-model-select').value});
+      remember({jobId, attempt, target: 'text'});
+      await monitor(attempt, 'text');
+    } catch (error) { operationError('text', error); }
+    finally { setBusy(false); }
   });
 
-  // --- Generate Audio ---
   $('generate-btn').addEventListener('click', startAudioGeneration);
   $('regenerate-btn').addEventListener('click', startAudioGeneration);
-
   async function startAudioGeneration() {
-    if (!jobId) return;
+    if (busy || !jobId) return;
     const text = $('text-area').value.trim();
     if (!text) { alert('Text area is empty.'); return; }
-
-    $('generate-btn').disabled = true;
+    setBusy(true);
     $('card-audio-log').classList.remove('hidden');
     $('card-audio').classList.add('hidden');
     $('audio-log').textContent = '';
     setStatus('audio', 'running');
+    try {
+      const attempt = await postJSON(`/generate-audio/${jobId}`, {
+        text, tts_engine: $('tts-engine-select').value});
+      remember({jobId, attempt, target: 'audio', text});
+      await monitor(attempt, 'audio');
+    } catch (error) { operationError('audio', error); }
+    finally { setBusy(false); }
+  }
 
-    const ttsEngine = $('tts-engine-select').value;
-    await fetch(`/generate-audio/${jobId}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, tts_engine: ttsEngine }),
-    });
-
-    streamJob(`/stream/${jobId}`, 'audio', msg => {
-      if (msg.type === 'done') {
-        const url = msg.audio_url;
-        $('audio-player').src = url;
-        $('download-btn').href = url + '?download=1';
-        $('card-audio').classList.remove('hidden');
-        $('card-audio').scrollIntoView({ behavior: 'smooth', block: 'start' });
-        $('generate-btn').disabled = false;
+  function showResult(msg, target) {
+    if (target === 'text') {
+      $('text-area').value = msg.text;
+      updateCharCount();
+      $('card-text').classList.remove('hidden');
+      const previous = document.getElementById('inspection-link');
+      if (previous) previous.remove();
+      if (msg.inspection_url) {
+        const link = document.createElement('a');
+        link.id = 'inspection-link'; link.href = msg.inspection_url;
+        link.textContent = 'Download narration diagnostics';
+        $('card-text').appendChild(link);
       }
+    } else {
+      $('audio-player').src = msg.audio_url;
+      $('download-btn').href = msg.audio_url + '?download=1';
+      $('card-audio').classList.remove('hidden');
+    }
+  }
+
+  function monitor(attempt, target) {
+    return new Promise((resolve, reject) => {
+      const es = new EventSource(attempt.stream_url);
+      let finished = false, checking = false, failures = 0;
+      const timer = setInterval(checkStatus, 3000);
+      function finish(msg) {
+        if (finished) return;
+        finished = true; es.close(); clearInterval(timer); forget();
+        if (msg.type === 'error') { reject(new Error(msg.message)); return; }
+        appendLog(target, 'Done!', 'done'); setStatus(target, 'done');
+        showResult(msg, target); resolve();
+      }
+      async function checkStatus() {
+        if (finished || checking) return;
+        checking = true;
+        try {
+          const state = await requestJSON(attempt.status_url);
+          failures = 0;
+          if (state.result) finish(state.result);
+        } catch (error) {
+          if (++failures >= 5) {
+            finished = true; es.close(); clearInterval(timer);
+            reject(new Error('Connection lost. Reload this page to reconnect to the saved attempt.'));
+          }
+        } finally { checking = false; }
+      }
+      es.onmessage = event => {
+        let msg;
+        try { msg = JSON.parse(event.data); } catch { return; }
+        if (msg.type === 'log') appendLog(target, msg.message, 'log');
+        if (msg.type === 'done' || msg.type === 'error') finish(msg);
+      };
+      // EventSource reconnects using Last-Event-ID; status lookup also recovers
+      // terminal results if the final event was lost.
+      es.onerror = checkStatus;
     });
   }
 
-  // --- SSE helper ---
-  function streamJob(url, logTarget, onDone) {
-    const es = new EventSource(url);
-    es.onmessage = e => {
-      let msg;
-      try { msg = JSON.parse(e.data); } catch { return; }
-
-      if (msg.type === 'ping') return;
-
-      if (msg.type === 'log') {
-        appendLog(logTarget, msg.message, 'log');
-      } else if (msg.type === 'done') {
-        appendLog(logTarget, '✓ Done!', 'done');
-        setStatus(logTarget, 'done');
-        es.close();
-        onDone(msg);
-      } else if (msg.type === 'error') {
-        appendLog(logTarget, `✗ Error: ${msg.message}`, 'error');
-        setStatus(logTarget, 'error');
-        $('generate-btn').disabled = false;
-        $('process-btn').disabled = false;
-        es.close();
-      }
-    };
-    es.onerror = () => {
-      appendLog(logTarget, 'Connection lost.', 'error');
-      setStatus(logTarget, 'error');
-      es.close();
-    };
-  }
+  (async function reconnect() {
+    let saved;
+    try { saved = JSON.parse(sessionStorage.getItem('paperAudioAttempt')); } catch {}
+    if (!saved || !saved.attempt) { setBusy(false); return; }
+    jobId = saved.jobId;
+    if (saved.text) {
+      $('text-area').value = saved.text; updateCharCount();
+      $('card-text').classList.remove('hidden');
+    }
+    setBusy(true);
+    $(saved.target === 'text' ? 'card-text-log' : 'card-audio-log').classList.remove('hidden');
+    setStatus(saved.target, 'running');
+    try { await monitor(saved.attempt, saved.target); }
+    catch (error) { operationError(saved.target, error); }
+    finally { setBusy(false); }
+  })();
 
   function appendLog(target, text, cls) {
     const box = target === 'text' ? $('text-log') : $('audio-log');
